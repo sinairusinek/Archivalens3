@@ -175,7 +175,7 @@ export const analyzePageContent = async (page: ArchivalPage, tier: 'FREE' | 'PAI
 export const transcribeAndTranslatePage = async (page: ArchivalPage, tier: 'FREE' | 'PAID'): Promise<Partial<ArchivalPage>> => {
   try {
     const imagePart = await fileToGenerativePart(page.fileObj, page.rotation || 0);
-    let prompt = `Transcribe this archival document exactly. 
+    let prompt = `Transcribe this archival document accurately. 
     Detect primary language.
     Identify production mode (strictly: "Handwritten", "Printed", "Typewritten", "No Text", or "Mixed Form").
     Preserve layout.
@@ -229,7 +229,7 @@ export const clusterPages = async (pages: ArchivalPage[], tier: Tier): Promise<C
 
   const prompt = `
     TASK: CLUSTERING & METADATA EXTRACTION
-    Analyze the provided archival pages and group them into logical documents (Clusters).
+    Analyse the provided archival pages and group them into sequential documents (Clusters) using  texutal, thematic and visual clues. Examples for "documents" are a letter (which can also include the scan of an envelope), a letter and a direct reply to it with the same topics, a group of closely related notes (which could include the image of the cover of a folder containing these notes), a report. 
 
     CRITICAL EXTRACTION RULES:
     1. EXTRACT SENDERS AND RECIPIENTS from both 'indexName' AND text content.
@@ -241,7 +241,7 @@ export const clusterPages = async (pages: ArchivalPage[], tier: Tier): Promise<C
     For EACH cluster:
     - title: Descriptive title.
     - pageRange: e.g. "Page 1-3".
-    - summary: 1-2 sentence description.
+    - summary: between 1 and 5 sentences, relative to the document's length, richness and complexity.
     - pageIds: array of IDs belonging to this cluster.
     - senders: array of {name, role, organizationCategory, nationality}.
     - recipients: array of {name, role, organizationCategory, nationality}.
