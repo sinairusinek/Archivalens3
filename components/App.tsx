@@ -2061,7 +2061,11 @@ const App: React.FC = () => {
                 value={(page as any)[pageViewField] || ''}
                 dir={getTextDirection((page as any)[pageViewField] || '')}
                 placeholder={`No ${tabs.find(t => t.key === pageViewField)?.label.toLowerCase()} yet…`}
-                onChange={e => setState(s => ({ ...s, files: s.files.map(f => f.id === pageViewId ? { ...f, [pageViewField]: e.target.value } : f) }))}
+                onChange={e => {
+                  setState(s => ({ ...s, files: s.files.map(f => f.id === pageViewId ? { ...f, [pageViewField]: e.target.value } : f) }));
+                  const owningCluster = state.clusters.find(c => c.pageIds.includes(pageViewId!));
+                  if (owningCluster) setDirtyClusterIds(prev => new Set(prev).add(owningCluster.id));
+                }}
               />
               <div className="p-4 border-t shrink-0">
                 <button onClick={() => setPageViewId(null)} className="w-full py-3 bg-slate-900 text-white rounded-2xl font-black uppercase text-xs tracking-widest hover:bg-blue-600 transition-all active:scale-95">
