@@ -1,8 +1,11 @@
 /**
  * SERVICE FOR GOOGLE DRIVE INTEGRATION
- * Replace 'YOUR_GOOGLE_CLIENT_ID' with one of your existing Client IDs from the console.
+ * Configure VITE_GOOGLE_CLIENT_ID in .env.local with your OAuth web client ID.
  */
-const CLIENT_ID = 'YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com';
+const CLIENT_ID =
+  import.meta.env.VITE_GOOGLE_CLIENT_ID ||
+  process.env.GOOGLE_CLIENT_ID ||
+  '';
 const SCOPES = 'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.readonly';
 
 let accessToken: string | null = null;
@@ -13,6 +16,10 @@ let accessToken: string | null = null;
 export const authenticateGoogleDrive = (): Promise<string> => {
   return new Promise((resolve, reject) => {
     if (accessToken) return resolve(accessToken);
+
+    if (!CLIENT_ID || CLIENT_ID.includes('YOUR_GOOGLE_CLIENT_ID')) {
+      return reject(new Error('Missing Google OAuth client ID. Set VITE_GOOGLE_CLIENT_ID in .env.local.'));
+    }
 
     if (!(window as any).google?.accounts?.oauth2) {
       return reject(new Error('Google Identity Services not loaded. Please refresh.'));

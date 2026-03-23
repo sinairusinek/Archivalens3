@@ -3,6 +3,12 @@ import { GoogleGenAI, Type } from "@google/genai";
 import { ArchivalPage, Cluster, Tier, DocType } from "../types";
 import { CONTROLLED_VOCABULARY, SUBJECTS_LIST, DOCUMENT_TYPES, PRISON_MASTER_LIST } from "./vocabulary";
 
+const GEMINI_API_KEY =
+  import.meta.env.VITE_GEMINI_API_KEY ||
+  process.env.GEMINI_API_KEY ||
+  process.env.API_KEY ||
+  "";
+
 const rotateCanvas = (sourceCanvas: HTMLCanvasElement, degrees: number): HTMLCanvasElement => {
   if (degrees === 0) return sourceCanvas;
   const canvas = document.createElement('canvas');
@@ -73,7 +79,10 @@ const fileToGenerativePart = async (file: File, rotation: number = 0): Promise<{
 };
 
 const generateContentWithRetry = async (params: any, retries = 3): Promise<any> => {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  if (!GEMINI_API_KEY) {
+    throw new Error("Missing Gemini API key. Set VITE_GEMINI_API_KEY in your .env.local file.");
+  }
+  const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
   try { return await ai.models.generateContent(params); } catch (e: any) {
     const isRateLimit = e.status === 429 || e.code === 429 || (e.message && e.message.includes('429')) || (e.status && e.status.toString().includes('RESOURCE_EXHAUSTED'));
     if (isRateLimit && retries > 0) {
@@ -128,19 +137,59 @@ const salvageJSONList = (jsonString: string): any[] => {
   }
 };
 
+const normalizeName = (name: string): string => {
+  return String(name || "")
+    .toLowerCase()
+    .trim()
+    .replace(/[.,;:!?()\[\]{}"'`~_\-/\\]+/g, " ")
+    .replace(/\s+/g, " ");
+};
+
+const splitAliases = (aliases: string | undefined): string[] => {
+  if (!aliases) return [];
+  return aliases
+    .split(/[|;,]/)
+    .map(a => a.trim())
+    .filter(Boolean);
+};
+
+const resolveVocabularyMatch = (name: string): { id?: number; normalizedName: string; mappingMethod: 'exact' | 'alias' | 'normalized' | 'none' } => {
+  const trimmed = String(name || "").trim();
+  const low = trimmed.toLowerCase();
+  const normalized = normalizeName(trimmed);
+
+  if (!trimmed) return { id: undefined, normalizedName: normalized, mappingMethod: 'none' };
+
+  const exactMatch = CONTROLLED_VOCABULARY.find(v => v.name.toLowerCase() === low);
+  if (exactMatch) return { id: exactMatch.id, normalizedName: normalized, mappingMethod: 'exact' };
+
+  const exactPrison = PRISON_MASTER_LIST.find(p => p.name.toLowerCase() === low);
+  if (exactPrison) return { id: exactPrison.id, normalizedName: normalized, mappingMethod: 'exact' };
+
+  const aliasMatch = CONTROLLED_VOCABULARY.find(v => splitAliases(v.otherNames).some(alias => {
+    const aliasLow = alias.toLowerCase();
+    return aliasLow === low || normalizeName(alias) === normalized;
+  }));
+  if (aliasMatch) return { id: aliasMatch.id, normalizedName: normalized, mappingMethod: 'alias' };
+
+  const normalizedMatch = CONTROLLED_VOCABULARY.find(v => normalizeName(v.name) === normalized);
+  if (normalizedMatch) return { id: normalizedMatch.id, normalizedName: normalized, mappingMethod: 'normalized' };
+
+  const normalizedPrisonMatch = PRISON_MASTER_LIST.find(p => normalizeName(p.name) === normalized);
+  if (normalizedPrisonMatch) return { id: normalizedPrisonMatch.id, normalizedName: normalized, mappingMethod: 'normalized' };
+
+  return { id: undefined, normalizedName: normalized, mappingMethod: 'none' };
+};
+
 const matchInVocabulary = (name: string): number | undefined => {
-  if (!name) return undefined;
-  const low = name.toLowerCase().trim();
-  const match = CONTROLLED_VOCABULARY.find(v => v.name.toLowerCase() === low);
-  if (match) return match.id;
-  const prisonMatch = PRISON_MASTER_LIST.find(p => p.name.toLowerCase() === low);
-  return prisonMatch?.id;
+  return resolveVocabularyMatch(name).id;
 };
 
 const findDocTypeByName = (name: string): DocType | undefined => {
   if (!name) return undefined;
   const low = name.toLowerCase().trim();
-  return DOCUMENT_TYPES.find(d => d.name.toLowerCase() === low);
+  const normalized = normalizeName(name);
+  return DOCUMENT_TYPES.find(d => d.name.toLowerCase() === low) || DOCUMENT_TYPES.find(d => normalizeName(d.name) === normalized);
 };
 
 export const analyzePageContent = async (page: ArchivalPage, tier: 'FREE' | 'PAID'): Promise<Partial<ArchivalPage>> => {
@@ -242,6 +291,8 @@ export const clusterPages = async (pages: ArchivalPage[], tier: Tier): Promise<C
     - title: Descriptive title.
     - pageRange: e.g. "Page 1-3".
     - summary: between 1 and 5 sentences, relative to the document's length, richness and complexity.
+    - aiConfidence: integer 1-5 where 1 = weak boundary confidence and 5 = strong confidence.
+    - boundaryReasons: short array of reasons for the split decision (e.g. date shift, sender change, thematic break, handwriting change).
     - pageIds: array of IDs belonging to this cluster.
     - senders: array of {name, role, organizationCategory, nationality}.
     - recipients: array of {name, role, organizationCategory, nationality}.
@@ -275,6 +326,8 @@ export const clusterPages = async (pages: ArchivalPage[], tier: Tier): Promise<C
               title: { type: Type.STRING },
               pageRange: { type: Type.STRING },
               summary: { type: Type.STRING },
+              aiConfidence: { type: Type.INTEGER },
+              boundaryReasons: { type: Type.ARRAY, items: { type: Type.STRING } },
               pageIds: { type: Type.ARRAY, items: { type: Type.STRING } },
               prisonName: { type: Type.STRING },
               docTypes: { type: Type.ARRAY, items: { type: Type.STRING } },
@@ -336,17 +389,48 @@ export const clusterPages = async (pages: ArchivalPage[], tier: Tier): Promise<C
     });
     
     const clusters = salvageJSONList(response.text || "[]");
+    const mapCorrespondent = (person: any) => {
+      const rawName = String(person?.name || "").trim();
+      const resolved = resolveVocabularyMatch(rawName);
+      return {
+        ...person,
+        name: rawName,
+        id: resolved.id,
+        rawName,
+        normalizedName: resolved.normalizedName,
+        mappingMethod: resolved.mappingMethod,
+      };
+    };
+
+    const mapEntityByName = (entity: any) => {
+      const rawName = String(entity?.name || "").trim();
+      const resolved = resolveVocabularyMatch(rawName);
+      return {
+        ...entity,
+        name: rawName,
+        id: resolved.id,
+        rawName,
+        normalizedName: resolved.normalizedName,
+        mappingMethod: resolved.mappingMethod,
+      };
+    };
+
     return clusters.map((c, idx) => ({
       ...c,
       id: c.id || idx + 1,
+      aiConfidence: typeof c.aiConfidence === 'number' ? c.aiConfidence : undefined,
+      boundaryReasons: Array.isArray(c.boundaryReasons) ? c.boundaryReasons : undefined,
+      pageRefs: Array.isArray(c.pageRefs) && c.pageRefs.length > 0
+        ? c.pageRefs
+        : (c.pageIds || []).map((pageId: string) => ({ pageId, source: 'ai' as const })),
       docTypes: (c.docTypes || []).map((name: string) => findDocTypeByName(name)).filter(Boolean),
-      senders: (c.senders || []).map((s: any) => ({ ...s, id: matchInVocabulary(s.name) })),
-      recipients: (c.recipients || []).map((r: any) => ({ ...r, id: matchInVocabulary(r.name) })),
+      senders: (c.senders || []).map((s: any) => mapCorrespondent(s)),
+      recipients: (c.recipients || []).map((r: any) => mapCorrespondent(r)),
       entities: {
-        people: (c.entities?.people || []).map((p: any) => ({ ...p, name: String(p.name), id: matchInVocabulary(String(p.name)) })),
-        organizations: (c.entities?.organizations || []).map((o: any) => ({ ...o, name: String(o.name), id: matchInVocabulary(String(o.name)) })),
-        prisons: (c.entities?.prisons || []).map((p: any) => ({ ...p, name: String(p.name), id: matchInVocabulary(String(p.name)) })),
-        roles: (c.entities?.roles || []).map((r: any) => ({ ...r, name: String(r.name), id: matchInVocabulary(String(r.name)) })),
+        people: (c.entities?.people || []).map((p: any) => mapEntityByName(p)),
+        organizations: (c.entities?.organizations || []).map((o: any) => mapEntityByName(o)),
+        prisons: (c.entities?.prisons || []).map((p: any) => mapEntityByName(p)),
+        roles: (c.entities?.roles || []).map((r: any) => mapEntityByName(r)),
       }
     }));
   };

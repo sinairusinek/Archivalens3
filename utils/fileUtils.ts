@@ -65,7 +65,11 @@ export const generateClustersTSV = (clusters: Cluster[]): string => {
   const headers = [
     "Cluster ID", 
     "Title", 
+    "Review Status",
+    "Reviewed By",
+    "Reviewed At",
     "Page Range", 
+    "Page References",
     "Summary",
     "Original Date",
     "Date (YYYY-MM-DD)",
@@ -86,7 +90,16 @@ export const generateClustersTSV = (clusters: Cluster[]): string => {
   const rows = clusters.map(c => [
     c.id.toString(),
     c.title,
+    c.reviewStatus || "",
+    c.reviewedBy || "",
+    c.reviewedAt || "",
     c.pageRange,
+    `"${(c.pageRefs || []).map(ref => {
+      if (typeof ref.startChar === 'number' && typeof ref.endChar === 'number') {
+        return `${ref.pageId}[${ref.startChar}-${ref.endChar}]${ref.note ? ` (${ref.note})` : ''}`;
+      }
+      return `${ref.pageId}${ref.note ? ` (${ref.note})` : ''}`;
+    }).join('; ')}"`,
     `"${c.summary.replace(/"/g, '""').replace(/\n/g, ' ')}"`,
     c.originalDate || "",
     c.standardizedDate || "",
@@ -152,6 +165,17 @@ export const generateFullJSON = (
   files: ArchivalPage[], 
   clusters: Cluster[]
 ): string => {
+  const reviewStats = {
+    aiProposed: clusters.filter(c => c.reviewStatus === 'ai-proposed' || !c.reviewStatus).length,
+    humanReviewed: clusters.filter(c => c.reviewStatus === 'human-reviewed').length,
+    final: clusters.filter(c => c.reviewStatus === 'final').length,
+  };
+
+  const segmentAssignments = clusters.reduce((acc, cluster) => {
+    const count = (cluster.pageRefs || []).filter(ref => typeof ref.startChar === 'number' && typeof ref.endChar === 'number').length;
+    return acc + count;
+  }, 0);
+
   const exportData = {
     projectTitle,
     archiveName,
@@ -162,7 +186,9 @@ export const generateFullJSON = (
     exportedAtISO: new Date().toISOString(),
     stats: {
       totalPages: files.length,
-      totalClusters: clusters.length
+      totalClusters: clusters.length,
+      clusterReviewStats: reviewStats,
+      segmentAssignments,
     },
     pages: files.map(p => ({
       id: p.id,
@@ -193,7 +219,7 @@ export const generateProjectBackup = (
   const backupData = {
     meta: {
       type: 'ARCHIVAL_LENS_BACKUP',
-      version: 1,
+      version: 2,
       createdAt: new Date().toISOString(),
       projectTitle,
       archiveName,

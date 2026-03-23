@@ -20,6 +20,9 @@ export interface ProcessingStatus {
 
 export interface EntityReference {
   name: string;
+  rawName?: string;
+  normalizedName?: string;
+  mappingMethod?: 'exact' | 'alias' | 'normalized' | 'none';
   id?: number;
   type?: 'person' | 'organization' | 'role' | 'prison';
   gender?: string;
@@ -43,6 +46,9 @@ export interface NamedEntities {
 
 export interface Correspondent {
   name: string;
+  rawName?: string;
+  normalizedName?: string;
+  mappingMethod?: 'exact' | 'alias' | 'normalized' | 'none';
   role?: string;
   id?: number;
   organizationCategory?: string;
@@ -53,6 +59,12 @@ export interface ArchivalPage {
   id: string; // unique ID
   fileName: string; // Original filename
   indexName: string; // The display name (Folder Name + Image Name or PDF Name + Page #)
+  sourceDocumentName?: string;
+  sourcePageNumber?: number;
+  sourcePath?: string;
+  ingestOrder?: number;
+  indexKey?: string;
+  indexSchemaVersion?: number;
   fileObj: File;
   previewUrl: string; // Object URL for thumbnail
   rotation?: number; // 0, 90, 180, 270 (degrees)
@@ -85,12 +97,26 @@ export interface DocType {
   name: string;
 }
 
+export interface ClusterPageRef {
+  pageId: string;
+  source: 'ai' | 'manual';
+  note?: string;
+  startChar?: number;
+  endChar?: number;
+}
+
 export interface Cluster {
   id: number;
   title: string;
   pageRange: string;
   summary: string;
   pageIds: string[];
+  pageRefs?: ClusterPageRef[];
+  reviewStatus?: 'ai-proposed' | 'human-reviewed' | 'final';
+  reviewedBy?: string;
+  reviewedAt?: string;
+  aiConfidence?: number;
+  boundaryReasons?: string[];
   
   // Detailed Metadata
   prisonName?: string;

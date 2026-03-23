@@ -9,7 +9,7 @@ import {
   ChevronDown as ChevronDownIcon, FileSearch, GraduationCap, FlagTriangleLeft, HandMetal, Heart, Landmark, Send, UserCircle, Eye,
   RefreshCw, Maximize, Minimize, User as UserIcon, Zap, Cpu, AlertCircle, ChevronLeft, Trash, ArrowDownAz, ArrowUpAz
 } from 'lucide-react';
-import { ArchivalPage, AppState, AnalysisMode, Tier, ProcessingStatus, Cluster, Correspondent, EntityReference, NamedEntities, ReconciliationRecord, SourceAppearance, DocType } from '../types';
+import { ArchivalPage, AppState, AnalysisMode, Tier, ProcessingStatus, Cluster, ClusterPageRef, Correspondent, EntityReference, NamedEntities, ReconciliationRecord, SourceAppearance, DocType } from '../types';
 import { analyzePageContent, transcribeAndTranslatePage, clusterPages } from '../services/geminiService';
 import { listFilesFromDrive, fetchFileFromDrive, uploadFileToDrive } from '../services/googleDriveService';
 import { generateTSV, generateClustersTSV, generateVocabularyCSV, generateMasterVocabularyCSV, generateFullJSON, generateProjectBackup, generateProjectZip, downloadFile, createImagePreview } from '../utils/fileUtils';
@@ -30,8 +30,14 @@ const PRESET_ARCHIVES = [
 
 const NATIONALITIES = ["Arab", "British", "German", "Jew", "Other"];
 
+const APP_API_KEY =
+  import.meta.env.VITE_GEMINI_API_KEY ||
+  process.env.GEMINI_API_KEY ||
+  process.env.API_KEY ||
+  null;
+
 const INITIAL_STATE: AppState = {
-  apiKey: process.env.API_KEY || null,
+  apiKey: APP_API_KEY,
   userName: "",
   mode: null,
   tier: Tier.FREE,
@@ -398,6 +404,8 @@ const App: React.FC = () => {
   const [archiveName, setArchiveName] = useState<string>("");
   const [expandedField, setExpandedField] = useState<{ pageId: string, field: 'manualTranscription' | 'manualDescription' | 'generatedTranslation', label: string } | null>(null);
   const [editingClusterId, setEditingClusterId] = useState<number | null>(null);
+  const [clusterPast, setClusterPast] = useState<Cluster[][]>([]);
+  const [clusterFuture, setClusterFuture] = useState<Cluster[][]>([]);
   
   const [isProcessingFiles, setIsProcessingFiles] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
@@ -424,6 +432,47 @@ const App: React.FC = () => {
     }
   }, [state.files]);
 
+  useEffect(() => {
+    if (state.uiState === 'welcome') return;
+    if (state.files.length === 0) return;
+    syncReconciliation();
+  }, [state.clusters, state.files, state.masterVocabulary]);
+
+  const normalizeIndexPart = (value: string): string =>
+    String(value || '')
+      .toLowerCase()
+      .trim()
+      .replace(/[.,;:!?()\[\]{}"'`~_\-/\\]+/g, '-')
+      .replace(/\s+/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '');
+
+  const buildIndexKey = (sourceDocumentName: string, fileName: string, sourcePageNumber?: number, sourcePath?: string): string => {
+    const base = [sourceDocumentName, fileName, sourcePath || '', sourcePageNumber?.toString() || '0']
+      .map(normalizeIndexPart)
+      .join('|');
+    return base;
+  };
+
+  const ensurePageIndexMetadata = (page: ArchivalPage, fallbackOrder: number): ArchivalPage => {
+    const pageNoFromFile = page.fileName.match(/_page_(\d+)/i)?.[1];
+    const derivedPageNo = pageNoFromFile ? parseInt(pageNoFromFile, 10) : undefined;
+    const sourceDocumentName = page.sourceDocumentName || page.fileName.replace(/_page_\d+\.[^/.]+$/i, '') || page.fileName;
+    const sourcePageNumber = page.sourcePageNumber ?? derivedPageNo ?? 1;
+    const sourcePath = page.sourcePath || page.fileName;
+    const ingestOrder = page.ingestOrder ?? fallbackOrder;
+
+    return {
+      ...page,
+      sourceDocumentName,
+      sourcePageNumber,
+      sourcePath,
+      ingestOrder,
+      indexSchemaVersion: page.indexSchemaVersion || 1,
+      indexKey: page.indexKey || buildIndexKey(sourceDocumentName, page.fileName, sourcePageNumber, sourcePath)
+    };
+  };
+
   const filteredPages = useMemo(() => {
     return state.files.filter(f => {
       const matchesSearch = f.indexName.toLowerCase().includes(searchTerm.toLowerCase()) ||
@@ -437,6 +486,357 @@ const App: React.FC = () => {
       return matchesSearch && matchesLang && matchesProd && matchesConf;
     });
   }, [state.files, searchTerm, filterLanguage, filterProductionMode, filterConfidence]);
+
+  const pageOrderMap = useMemo(() => {
+    return new Map(state.files.map((file, index) => [file.id, index + 1]));
+  }, [state.files]);
+
+  const MAX_CLUSTER_HISTORY = 50;
+
+  const snapshotClusters = (clusters: Cluster[]): Cluster[] => {
+    return clusters.map(c => ({
+      ...c,
+      pageIds: [...c.pageIds],
+      pageRefs: c.pageRefs ? c.pageRefs.map(ref => ({ ...ref })) : c.pageRefs,
+      docTypes: c.docTypes ? [...c.docTypes] : c.docTypes,
+      subjects: c.subjects ? [...c.subjects] : c.subjects,
+      languages: c.languages ? [...c.languages] : c.languages,
+      senders: c.senders ? c.senders.map(s => ({ ...s })) : c.senders,
+      recipients: c.recipients ? c.recipients.map(r => ({ ...r })) : c.recipients,
+      entities: c.entities ? {
+        people: [...(c.entities.people || [])],
+        organizations: [...(c.entities.organizations || [])],
+        roles: [...(c.entities.roles || [])],
+        prisons: [...(c.entities.prisons || [])],
+      } : c.entities,
+    }));
+  };
+
+  const buildPageRangeFromIds = (pageIds: string[]): string => {
+    const pageNumbers = pageIds
+      .map(id => pageOrderMap.get(id))
+      .filter((num): num is number => typeof num === 'number')
+      .sort((a, b) => a - b);
+
+    if (pageNumbers.length === 0) return 'No Pages';
+    if (pageNumbers.length === 1) return `Page ${pageNumbers[0]}`;
+    return `Page ${pageNumbers[0]}-${pageNumbers[pageNumbers.length - 1]}`;
+  };
+
+  const normalizeClusterSet = (clusters: Cluster[]): Cluster[] => {
+    return clusters
+      .filter(c => c.pageIds.length > 0)
+      .map((cluster, index) => {
+        const uniquePageIds = Array.from(new Set(cluster.pageIds))
+          .sort((a, b) => (pageOrderMap.get(a) || Number.MAX_SAFE_INTEGER) - (pageOrderMap.get(b) || Number.MAX_SAFE_INTEGER));
+
+        const existingRefs = (cluster.pageRefs || []).filter(ref => uniquePageIds.includes(ref.pageId));
+        const fullPageRefs = uniquePageIds
+          .filter(pageId => !existingRefs.some(ref => ref.pageId === pageId && ref.startChar === undefined && ref.endChar === undefined))
+          .map(pageId => ({ pageId, source: cluster.reviewStatus === 'ai-proposed' ? 'ai' as const : 'manual' as const }));
+
+        return {
+          ...cluster,
+          pageIds: uniquePageIds,
+          pageRefs: [...existingRefs, ...fullPageRefs],
+          id: index + 1,
+          pageRange: buildPageRangeFromIds(uniquePageIds),
+        };
+      });
+  };
+
+  const markClustersAsAiProposed = (clusters: Cluster[]): Cluster[] => {
+    return clusters.map(cluster => ({
+      ...cluster,
+      pageRefs: cluster.pageRefs && cluster.pageRefs.length > 0
+        ? cluster.pageRefs
+        : cluster.pageIds.map(pageId => ({ pageId, source: 'ai' as const })),
+      reviewStatus: cluster.reviewStatus || 'ai-proposed',
+      reviewedBy: cluster.reviewedBy,
+      reviewedAt: cluster.reviewedAt,
+    }));
+  };
+
+  const commitClusterEdit = (updater: (clusters: Cluster[]) => Cluster[], options?: { markAsHumanReviewed?: boolean }) => {
+    setState(prev => {
+      const previousClusters = snapshotClusters(prev.clusters);
+      let updatedClusters = normalizeClusterSet(updater(snapshotClusters(prev.clusters)));
+      const markAsHumanReviewed = options?.markAsHumanReviewed ?? true;
+
+      if (markAsHumanReviewed) {
+        const now = new Date().toISOString();
+        updatedClusters = updatedClusters.map(cluster => {
+          if (cluster.reviewStatus === 'final') {
+            return cluster;
+          }
+          return {
+            ...cluster,
+            reviewStatus: 'human-reviewed',
+            reviewedBy: prev.userName || cluster.reviewedBy,
+            reviewedAt: now,
+          };
+        });
+      }
+
+      if (JSON.stringify(previousClusters) === JSON.stringify(updatedClusters)) return prev;
+
+      setClusterPast(history => [...history.slice(-(MAX_CLUSTER_HISTORY - 1)), previousClusters]);
+      setClusterFuture([]);
+
+      setTimeout(() => syncReconciliation(), 0);
+      return { ...prev, clusters: updatedClusters };
+    });
+  };
+
+  const keepClusterAsFinal = (clusterId: number) => {
+    commitClusterEdit((clusters) => {
+      const now = new Date().toISOString();
+      return clusters.map(cluster => cluster.id === clusterId ? {
+        ...cluster,
+        reviewStatus: 'final',
+        reviewedBy: state.userName || cluster.reviewedBy,
+        reviewedAt: now,
+      } : cluster);
+    }, { markAsHumanReviewed: false });
+  };
+
+  const keepAllClustersAsFinal = () => {
+    commitClusterEdit((clusters) => {
+      const now = new Date().toISOString();
+      return clusters.map(cluster => ({
+        ...cluster,
+        reviewStatus: 'final',
+        reviewedBy: state.userName || cluster.reviewedBy,
+        reviewedAt: now,
+      }));
+    }, { markAsHumanReviewed: false });
+  };
+
+  const splitClusterAtPage = (clusterId: number, splitAtPageId: string) => {
+    commitClusterEdit((clusters) => {
+      const index = clusters.findIndex(c => c.id === clusterId);
+      if (index < 0) return clusters;
+      const target = clusters[index];
+      const splitIndex = target.pageIds.indexOf(splitAtPageId);
+      if (splitIndex <= 0) return clusters;
+
+      const first = { ...target, pageIds: target.pageIds.slice(0, splitIndex) };
+      const second = {
+        ...target,
+        title: `${target.title} (Part 2)`,
+        pageIds: target.pageIds.slice(splitIndex),
+      };
+
+      const next = [...clusters];
+      next.splice(index, 1, first, second);
+      return next;
+    });
+  };
+
+  const mergeWithPreviousCluster = (clusterId: number) => {
+    commitClusterEdit((clusters) => {
+      const index = clusters.findIndex(c => c.id === clusterId);
+      if (index <= 0) return clusters;
+
+      const previous = clusters[index - 1];
+      const current = clusters[index];
+      const merged = {
+        ...previous,
+        pageIds: [...previous.pageIds, ...current.pageIds]
+          .sort((a, b) => (pageOrderMap.get(a) || Number.MAX_SAFE_INTEGER) - (pageOrderMap.get(b) || Number.MAX_SAFE_INTEGER)),
+      };
+
+      const next = [...clusters];
+      next.splice(index - 1, 2, merged);
+      return next;
+    });
+  };
+
+  const movePageToCluster = (pageId: string, destinationClusterId: number) => {
+    commitClusterEdit((clusters) => {
+      const destination = clusters.find(c => c.id === destinationClusterId);
+      if (!destination) return clusters;
+
+      const removed = clusters.map(cluster => ({
+        ...cluster,
+        pageIds: cluster.pageIds.filter(id => id !== pageId),
+        pageRefs: cluster.pageRefs?.filter(ref => ref.pageId !== pageId),
+      }));
+
+      const destinationIndex = removed.findIndex(c => c.id === destinationClusterId);
+      if (destinationIndex < 0) return clusters;
+
+      if (!removed[destinationIndex].pageIds.includes(pageId)) {
+        removed[destinationIndex] = {
+          ...removed[destinationIndex],
+          pageIds: [...removed[destinationIndex].pageIds, pageId]
+            .sort((a, b) => (pageOrderMap.get(a) || Number.MAX_SAFE_INTEGER) - (pageOrderMap.get(b) || Number.MAX_SAFE_INTEGER)),
+          pageRefs: [
+            ...(removed[destinationIndex].pageRefs || []).filter(ref => ref.pageId !== pageId),
+            { pageId, source: 'manual' as const }
+          ],
+        };
+      }
+
+      return removed;
+    });
+  };
+
+  const copyPageAsPartialToCluster = (pageId: string, destinationClusterId: number, startChar?: number, endChar?: number, note?: string) => {
+    commitClusterEdit((clusters) => {
+      const destinationIndex = clusters.findIndex(c => c.id === destinationClusterId);
+      if (destinationIndex < 0) return clusters;
+
+      const next = [...clusters];
+      const destination = next[destinationIndex];
+      const refs: ClusterPageRef[] = destination.pageRefs ? [...destination.pageRefs] : [];
+
+      const existingFullRef = refs.find(ref => ref.pageId === pageId && ref.startChar === undefined && ref.endChar === undefined);
+      const fullNote = note || 'Partial page assignment';
+      const alreadyMarked = refs.some(ref =>
+        ref.pageId === pageId &&
+        (startChar === undefined ? ref.note === fullNote : ref.startChar === startChar && ref.endChar === endChar)
+      );
+
+      if (!alreadyMarked) {
+        refs.push({
+          pageId,
+          source: 'manual',
+          note: startChar === undefined ? fullNote : (note || 'Segment assignment'),
+          startChar,
+          endChar,
+        });
+      }
+
+      if (existingFullRef && startChar !== undefined) {
+        existingFullRef.note = existingFullRef.note || 'Page also has segment assignment';
+      }
+
+      next[destinationIndex] = {
+        ...destination,
+        pageIds: destination.pageIds.includes(pageId)
+          ? destination.pageIds
+          : [...destination.pageIds, pageId]
+              .sort((a, b) => (pageOrderMap.get(a) || Number.MAX_SAFE_INTEGER) - (pageOrderMap.get(b) || Number.MAX_SAFE_INTEGER)),
+        pageRefs: refs,
+      };
+
+      return next;
+    });
+  };
+
+  const promptAndCopySegment = (pageId: string, destinationClusterId: number) => {
+    const useSegment = confirm('Copy full page as partial assignment?\nPress OK for full-page copy, Cancel to define a character segment.');
+    if (useSegment) {
+      copyPageAsPartialToCluster(pageId, destinationClusterId);
+      return;
+    }
+
+    const startInput = prompt('Segment start character index (>= 0):', '0');
+    if (startInput === null) return;
+    const endInput = prompt('Segment end character index (> start):', '200');
+    if (endInput === null) return;
+    const noteInput = prompt('Optional segment note:', '');
+
+    const startChar = parseInt(startInput, 10);
+    const endChar = parseInt(endInput, 10);
+    if (isNaN(startChar) || isNaN(endChar) || startChar < 0 || endChar <= startChar) {
+      alert('Invalid range. Segment was not added.');
+      return;
+    }
+
+    copyPageAsPartialToCluster(pageId, destinationClusterId, startChar, endChar, noteInput || undefined);
+  };
+
+  const undoClusterEdit = () => {
+    if (clusterPast.length === 0) return;
+    const previous = snapshotClusters(clusterPast[clusterPast.length - 1]);
+    const current = snapshotClusters(state.clusters);
+    setClusterPast(history => history.slice(0, -1));
+    setClusterFuture(history => [current, ...history].slice(0, MAX_CLUSTER_HISTORY));
+    setState(s => ({ ...s, clusters: normalizeClusterSet(previous) }));
+    setTimeout(() => syncReconciliation(), 0);
+  };
+
+  const redoClusterEdit = () => {
+    if (clusterFuture.length === 0) return;
+    const [next, ...rest] = clusterFuture;
+    const current = snapshotClusters(state.clusters);
+    setClusterFuture(rest);
+    setClusterPast(history => [...history.slice(-(MAX_CLUSTER_HISTORY - 1)), current]);
+    setState(s => ({ ...s, clusters: normalizeClusterSet(snapshotClusters(next)) }));
+    setTimeout(() => syncReconciliation(), 0);
+  };
+
+  const assignedPageCount = useMemo(() => {
+    const counts = new Map<string, number>();
+    state.clusters.forEach(cluster => {
+      cluster.pageIds.forEach(pageId => counts.set(pageId, (counts.get(pageId) || 0) + 1));
+    });
+    return counts;
+  }, [state.clusters]);
+
+  const duplicateAssignedPageIds = useMemo(() => {
+    return Array.from(assignedPageCount.entries())
+      .filter(([, count]) => count > 1)
+      .map(([id]) => id);
+  }, [assignedPageCount]);
+
+  const intentionallySharedPageIds = useMemo(() => {
+    const shared = new Set<string>();
+    state.clusters.forEach(cluster => {
+      cluster.pageRefs?.forEach(ref => {
+        if (ref.note === 'Partial page assignment' || typeof ref.startChar === 'number' || typeof ref.endChar === 'number') {
+          shared.add(ref.pageId);
+        }
+      });
+    });
+    return shared;
+  }, [state.clusters]);
+
+  const duplicateConflictPageIds = useMemo(() => {
+    return duplicateAssignedPageIds.filter(pageId => !intentionallySharedPageIds.has(pageId));
+  }, [duplicateAssignedPageIds, intentionallySharedPageIds]);
+
+  const unassignedPages = useMemo(() => {
+    const assignedIds = new Set(Array.from(assignedPageCount.keys()));
+    return state.files.filter(file => !assignedIds.has(file.id));
+  }, [state.files, assignedPageCount]);
+
+  const lowConfidenceClusters = useMemo(() => {
+    return state.clusters.filter(cluster => typeof cluster.aiConfidence === 'number' && cluster.aiConfidence <= 2);
+  }, [state.clusters]);
+
+  const clusterReviewStats = useMemo(() => {
+    const stats = { proposed: 0, reviewed: 0, final: 0 };
+    state.clusters.forEach(cluster => {
+      if (cluster.reviewStatus === 'final') stats.final += 1;
+      else if (cluster.reviewStatus === 'human-reviewed') stats.reviewed += 1;
+      else stats.proposed += 1;
+    });
+    return stats;
+  }, [state.clusters]);
+
+  const createClusterFromSinglePage = (pageId: string) => {
+    const page = state.files.find(f => f.id === pageId);
+    if (!page) return;
+    commitClusterEdit((clusters) => {
+      return [
+        ...clusters,
+        {
+          id: clusters.length + 1,
+          title: `New Document - ${page.indexName}`,
+          summary: 'Manual cluster created from unassigned page.',
+          pageRange: '',
+          pageIds: [page.id],
+          pageRefs: [{ pageId: page.id, source: 'manual' }],
+          reviewStatus: 'human-reviewed',
+          reviewedBy: state.userName || undefined,
+          reviewedAt: new Date().toISOString(),
+        }
+      ];
+    });
+  };
 
   const toggleFullscreen = () => {
     if (!document.fullscreenElement) {
@@ -545,7 +945,9 @@ const App: React.FC = () => {
         setArchiveName(backup.meta?.archiveName || "");
       }
 
-      setState(s => ({ ...INITIAL_STATE, ...appData, files: restoredFiles, uiState: 'dashboard' }));
+      const normalizedRestoredFiles = restoredFiles.map((f, i) => ensurePageIndexMetadata(f as ArchivalPage, i + 1));
+      const restoredClusters = normalizeClusterSet(markClustersAsAiProposed((appData.clusters || []) as Cluster[]));
+      setState(s => ({ ...INITIAL_STATE, ...appData, files: normalizedRestoredFiles, clusters: restoredClusters, uiState: 'dashboard' }));
     } catch (err: any) {
       console.error("Restoration Error:", err);
       alert(`Resume failed: ${err.message}`);
@@ -644,6 +1046,12 @@ const App: React.FC = () => {
                 id: crypto.randomUUID(),
                 fileName: pageFile.name,
                 indexName: `${file.name} - Page ${i}`,
+                sourceDocumentName: file.name,
+                sourcePageNumber: i,
+                sourcePath: (file as any).webkitRelativePath || file.name,
+                ingestOrder: allExtractedPages.length + 1,
+                indexSchemaVersion: 1,
+                indexKey: buildIndexKey(file.name, pageFile.name, i, (file as any).webkitRelativePath || file.name),
                 fileObj: pageFile,
                 previewUrl: URL.createObjectURL(pageFile),
                 shouldTranscribe: false,
@@ -664,6 +1072,12 @@ const App: React.FC = () => {
           id: crypto.randomUUID(),
           fileName: file.name,
           indexName: `${derivedTitle} - ${file.name}`,
+          sourceDocumentName: file.name,
+          sourcePageNumber: 1,
+          sourcePath: (file as any).webkitRelativePath || file.name,
+          ingestOrder: allExtractedPages.length + 1,
+          indexSchemaVersion: 1,
+          indexKey: buildIndexKey(file.name, file.name, 1, (file as any).webkitRelativePath || file.name),
           fileObj: file,
           previewUrl,
           shouldTranscribe: false,
@@ -675,7 +1089,7 @@ const App: React.FC = () => {
       }
     }
 
-    setState(s => ({ ...s, mode, files: allExtractedPages, uiState: 'config' }));
+    setState(s => ({ ...s, mode, files: allExtractedPages.map((f, i) => ensurePageIndexMetadata(f, i + 1)), uiState: 'config' }));
     setIsProcessingFiles(false);
   };
 
@@ -1127,12 +1541,23 @@ const App: React.FC = () => {
                         <button onClick={() => setState(s => ({ ...s, uiState: 'dashboard' }))} className="p-2.5 bg-white border border-slate-200 text-slate-500 hover:bg-slate-50 rounded-xl transition-all flex items-center gap-2 text-[10px] font-black uppercase tracking-widest">
                             <ChevronLeft className="w-3.5 h-3.5" /> Back to Pages
                         </button>
+                        <button onClick={undoClusterEdit} disabled={clusterPast.length === 0} className="p-2.5 bg-white border border-slate-200 text-slate-500 hover:bg-slate-50 rounded-xl transition-all flex items-center gap-2 text-[10px] font-black uppercase tracking-widest disabled:opacity-40">
+                          <RotateCcw className="w-3.5 h-3.5" /> Undo
+                        </button>
+                        <button onClick={redoClusterEdit} disabled={clusterFuture.length === 0} className="p-2.5 bg-white border border-slate-200 text-slate-500 hover:bg-slate-50 rounded-xl transition-all flex items-center gap-2 text-[10px] font-black uppercase tracking-widest disabled:opacity-40">
+                          <RotateCw className="w-3.5 h-3.5" /> Redo
+                        </button>
+                        <button onClick={keepAllClustersAsFinal} disabled={state.clusters.length === 0} className="p-2.5 bg-emerald-50 border border-emerald-200 text-emerald-700 hover:bg-emerald-100 rounded-xl transition-all flex items-center gap-2 text-[10px] font-black uppercase tracking-widest disabled:opacity-40">
+                          <CheckCircle className="w-3.5 h-3.5" /> Keep All
+                        </button>
                         <button onClick={async () => { 
+                          setClusterPast([]);
+                          setClusterFuture([]);
                             setState(s => ({ ...s, clusters: [], reconciliationList: [], processingStatus: { total: state.files.length, processed: 0, currentStep: 'Running Gemini Cluster Analysis...', isComplete: false } })); 
                             try { 
                                 const clusters = await clusterPages(state.files, state.tier); 
-                                setState(s => ({ ...s, clusters, reconciliationList: [], processingStatus: { ...s.processingStatus, isComplete: true, processed: state.files.length } })); 
-                                syncReconciliation(); 
+                              setState(s => ({ ...s, clusters: normalizeClusterSet(markClustersAsAiProposed(clusters)), reconciliationList: [], processingStatus: { ...s.processingStatus, isComplete: true, processed: state.files.length } })); 
+                            setTimeout(() => syncReconciliation(), 0);
                             } catch (e) { 
                                 alert("Clustering failed."); 
                                 setState(s => ({ ...s, processingStatus: { ...s.processingStatus, isComplete: true } }));
@@ -1142,6 +1567,77 @@ const App: React.FC = () => {
                  )}
                  <div className="flex-1 p-12 overflow-y-auto custom-scrollbar">
                    <div className="max-w-7xl mx-auto space-y-12">
+                     {state.clusters.length > 0 && (
+                       <div className="bg-white border rounded-[24px] p-4 flex flex-wrap items-center gap-3">
+                         <span className="px-3 py-1 rounded-xl text-[10px] font-black uppercase tracking-widest bg-amber-50 border border-amber-200 text-amber-700">AI Proposed: {clusterReviewStats.proposed}</span>
+                         <span className="px-3 py-1 rounded-xl text-[10px] font-black uppercase tracking-widest bg-blue-50 border border-blue-200 text-blue-700">Human Reviewed: {clusterReviewStats.reviewed}</span>
+                         <span className="px-3 py-1 rounded-xl text-[10px] font-black uppercase tracking-widest bg-emerald-50 border border-emerald-200 text-emerald-700">Final: {clusterReviewStats.final}</span>
+                       </div>
+                     )}
+
+                     {(duplicateConflictPageIds.length > 0 || unassignedPages.length > 0 || lowConfidenceClusters.length > 0 || intentionallySharedPageIds.size > 0) && (
+                       <div className="bg-amber-50 border border-amber-200 rounded-[28px] p-6">
+                         <div className="flex items-center gap-2 text-amber-700 text-xs font-black uppercase tracking-widest mb-3">
+                           <AlertTriangle className="w-4 h-4" /> Index Validation
+                         </div>
+                         <div className="space-y-2 text-[11px] font-bold text-amber-800">
+                           {duplicateConflictPageIds.length > 0 && (
+                             <div>{duplicateConflictPageIds.length} page(s) are assigned to more than one document without partial-page marking.</div>
+                           )}
+                           {unassignedPages.length > 0 && (
+                             <div>{unassignedPages.length} page(s) are currently unassigned.</div>
+                           )}
+                           {intentionallySharedPageIds.size > 0 && (
+                             <div>{intentionallySharedPageIds.size} page(s) are intentionally shared as partial-page assignments.</div>
+                           )}
+                           {lowConfidenceClusters.length > 0 && (
+                             <div>{lowConfidenceClusters.length} document boundary decision(s) have low AI confidence (≤2).</div>
+                           )}
+                         </div>
+                       </div>
+                     )}
+
+                     {unassignedPages.length > 0 && (
+                       <div className="bg-white rounded-[32px] border p-8 shadow-sm space-y-5">
+                         <div className="flex items-center justify-between">
+                           <h3 className="text-lg font-black uppercase tracking-tight text-slate-900">Unassigned Pages</h3>
+                           <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">Assign or create document</span>
+                         </div>
+                         <div className="flex gap-4 overflow-x-auto pb-2 custom-scrollbar">
+                           {unassignedPages.map(page => (
+                             <div key={page.id} className="shrink-0 w-28 space-y-2">
+                               <img
+                                 src={page.previewUrl}
+                                 className="h-32 w-24 object-cover rounded-xl border cursor-zoom-in hover:scale-105 transition-all shadow-sm"
+                                 onClick={() => setZoomedPageId(page.id)}
+                               />
+                               <button
+                                 onClick={() => createClusterFromSinglePage(page.id)}
+                                 className="w-full px-2 py-1 text-[8px] font-black uppercase tracking-widest rounded-lg bg-blue-50 text-blue-700 border border-blue-100 hover:bg-blue-100 transition-all"
+                               >
+                                 New Doc
+                               </button>
+                               <select
+                                 defaultValue=""
+                                 onChange={(e) => {
+                                   const destination = parseInt(e.target.value, 10);
+                                   if (!isNaN(destination)) {
+                                     movePageToCluster(page.id, destination);
+                                   }
+                                 }}
+                                 className="w-full px-2 py-1 text-[8px] font-black uppercase tracking-widest rounded-lg bg-slate-50 border border-slate-200 text-slate-600 outline-none"
+                               >
+                                 <option value="">Assign...</option>
+                                 {state.clusters.map(dest => (
+                                   <option key={dest.id} value={dest.id}>Doc #{dest.id}</option>
+                                 ))}
+                               </select>
+                             </div>
+                           ))}
+                         </div>
+                       </div>
+                     )}
+
                      {state.clusters.length === 0 && (
                        <div className="flex flex-col items-center justify-center py-40 text-center space-y-4 opacity-40">
                          <div className="p-10 bg-slate-100 rounded-full"><LayoutGrid className="w-16 h-16 text-slate-400" /></div>
@@ -1151,17 +1647,57 @@ const App: React.FC = () => {
                          </div>
                        </div>
                      )}
-                     {state.clusters.map(c => (
+                     {state.clusters.map((c, clusterIndex) => (
                        <div key={c.id} className="bg-white rounded-[40px] border overflow-hidden shadow-sm hover:shadow-2xl transition-all p-12 group relative">
                          <button onClick={() => setEditingClusterId(c.id)} className="absolute top-12 right-12 p-3.5 bg-slate-50 text-slate-400 hover:bg-slate-900 hover:text-white rounded-2xl transition-all opacity-0 group-hover:opacity-100 shadow-sm"><Edit3 className="w-5 h-5" /></button>
-                         <div className="flex items-center gap-3 mb-8"><div className="bg-blue-600 text-white text-xs font-black px-5 py-1.5 rounded-full uppercase">Doc #{c.id}</div><div className="text-slate-300 font-black uppercase text-[10px] tracking-widest">{c.pageRange}</div></div>
+                         <div className="flex items-center gap-3 mb-8 flex-wrap">
+                           <div className="bg-blue-600 text-white text-xs font-black px-5 py-1.5 rounded-full uppercase">Doc #{c.id}</div>
+                           <div className="text-slate-300 font-black uppercase text-[10px] tracking-widest">{c.pageRange}</div>
+                           <span className={`px-3 py-1 rounded-xl text-[9px] font-black uppercase tracking-widest border ${
+                             c.reviewStatus === 'final'
+                               ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                               : c.reviewStatus === 'human-reviewed'
+                                 ? 'bg-blue-50 text-blue-700 border-blue-200'
+                                 : 'bg-amber-50 text-amber-700 border-amber-200'
+                           }`}>
+                             {c.reviewStatus === 'final' ? 'Final (Kept)' : c.reviewStatus === 'human-reviewed' ? 'Human Reviewed' : 'AI Proposed'}
+                           </span>
+                           <button
+                             onClick={() => keepClusterAsFinal(c.id)}
+                             className="px-3 py-1.5 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-xl text-[9px] font-black uppercase tracking-widest hover:bg-emerald-100 transition-all"
+                           >
+                             Keep
+                           </button>
+                           {clusterIndex > 0 && (
+                             <button
+                               onClick={() => mergeWithPreviousCluster(c.id)}
+                               className="px-3 py-1.5 bg-slate-100 text-slate-700 rounded-xl text-[9px] font-black uppercase tracking-widest hover:bg-slate-900 hover:text-white transition-all"
+                             >
+                               Merge with Previous
+                             </button>
+                           )}
+                         </div>
                          <div className="grid grid-cols-1 lg:grid-cols-12 gap-16">
                             <div className="lg:col-span-12 space-y-8">
                               <h3 className="text-3xl font-black text-slate-800 leading-tight tracking-tight">{c.title}</h3>
                               <div className="flex flex-wrap gap-2">
+                                  {typeof c.aiConfidence === 'number' && (
+                                    <span className={`px-3 py-1 rounded-xl text-[9px] font-black uppercase tracking-widest border ${c.aiConfidence <= 2 ? 'bg-red-50 text-red-700 border-red-200' : 'bg-slate-100 text-slate-600 border-slate-200'}`}>
+                                      AI Confidence: {c.aiConfidence}/5
+                                    </span>
+                                  )}
                                 {c.docTypes?.map(dt => <span key={dt.id} className="px-3 py-1 bg-slate-100 text-slate-600 rounded-xl text-[9px] font-black uppercase tracking-widest border"> {dt.name} <span className="opacity-40 text-[7px]">#{dt.id}</span> </span>)}
                                 {c.prisonName && <span className="px-3 py-1 bg-emerald-50 text-emerald-700 border-emerald-100 rounded-xl text-[9px] font-black uppercase tracking-widest border flex items-center gap-1"><MapPin className="w-2.5 h-2.5" /> {c.prisonName}</span>}
                               </div>
+                                {c.boundaryReasons && c.boundaryReasons.length > 0 && (
+                                  <div className="flex flex-wrap gap-2">
+                                    {c.boundaryReasons.map((reason, reasonIdx) => (
+                                      <span key={`${c.id}-reason-${reasonIdx}`} className="px-2 py-1 bg-amber-50 border border-amber-100 text-amber-700 rounded-lg text-[8px] font-black uppercase tracking-widest">
+                                        {reason}
+                                      </span>
+                                    ))}
+                                  </div>
+                                )}
                               <p className="text-slate-500 leading-relaxed text-base font-medium italic border-l-4 pl-6">{c.summary}</p>
                               
                               <div className="grid grid-cols-1 md:grid-cols-2 gap-6 bg-slate-50/50 p-8 rounded-[32px] border">
@@ -1234,13 +1770,75 @@ const App: React.FC = () => {
                               </div>
                             </div>
                          </div>
-                         <div className="mt-12 flex gap-4 overflow-x-auto pb-4 custom-scrollbar">{c.pageIds.map(pid => { const p = state.files.find(f => f.id === pid); return p ? <div key={pid} className="shrink-0"><img src={p.previewUrl} className="h-32 w-24 object-cover rounded-xl border cursor-zoom-in hover:scale-105 transition-all shadow-sm" onClick={() => setZoomedPageId(p.id)} /></div> : null; })}</div>
+                         <div className="mt-12 flex gap-4 overflow-x-auto pb-4 custom-scrollbar">
+                           {c.pageIds.map((pid, pageIndexInCluster) => {
+                             const p = state.files.find(f => f.id === pid);
+                             if (!p) return null;
+                             const usageCount = assignedPageCount.get(pid) || 0;
+                             const isShared = usageCount > 1;
+                             const segmentRefs = (c.pageRefs || []).filter(ref => ref.pageId === pid && typeof ref.startChar === 'number' && typeof ref.endChar === 'number');
+                             return (
+                               <div key={pid} className="shrink-0 space-y-2">
+                                 <img src={p.previewUrl} className="h-32 w-24 object-cover rounded-xl border cursor-zoom-in hover:scale-105 transition-all shadow-sm" onClick={() => setZoomedPageId(p.id)} />
+                                 <div className="flex flex-col gap-1 w-24">
+                                   {isShared && (
+                                     <span className="px-1.5 py-0.5 text-[7px] font-black uppercase tracking-widest rounded-md bg-purple-50 text-purple-700 border border-purple-100 text-center">
+                                       Shared ({usageCount})
+                                     </span>
+                                   )}
+                                   {segmentRefs.length > 0 && (
+                                     <span className="px-1.5 py-0.5 text-[7px] font-black uppercase tracking-widest rounded-md bg-violet-50 text-violet-700 border border-violet-100 text-center">
+                                       Segments ({segmentRefs.length})
+                                     </span>
+                                   )}
+                                   {pageIndexInCluster > 0 && (
+                                     <button
+                                       onClick={() => splitClusterAtPage(c.id, pid)}
+                                       className="px-2 py-1 text-[8px] font-black uppercase tracking-widest rounded-lg bg-amber-50 text-amber-700 border border-amber-100 hover:bg-amber-100 transition-all"
+                                     >
+                                       Split Here
+                                     </button>
+                                   )}
+                                   <select
+                                     value={c.id}
+                                     onChange={(e) => movePageToCluster(pid, parseInt(e.target.value, 10))}
+                                     className="px-2 py-1 text-[8px] font-black uppercase tracking-widest rounded-lg bg-slate-50 border border-slate-200 text-slate-600 outline-none"
+                                   >
+                                     {state.clusters.map(dest => (
+                                       <option key={dest.id} value={dest.id}>Doc #{dest.id}</option>
+                                     ))}
+                                   </select>
+                                   <select
+                                     defaultValue=""
+                                     onChange={(e) => {
+                                       const destination = parseInt(e.target.value, 10);
+                                       if (!isNaN(destination)) {
+                                         promptAndCopySegment(pid, destination);
+                                       }
+                                     }}
+                                     className="px-2 py-1 text-[8px] font-black uppercase tracking-widest rounded-lg bg-purple-50 border border-purple-100 text-purple-700 outline-none"
+                                   >
+                                     <option value="">Copy Partial...</option>
+                                     {state.clusters.map(dest => (
+                                       <option key={`copy-${dest.id}`} value={dest.id}>Doc #{dest.id}</option>
+                                     ))}
+                                   </select>
+                                  {segmentRefs.slice(0, 2).map((ref, idx) => (
+                                    <span key={`${pid}-seg-${idx}`} className="px-1.5 py-0.5 text-[7px] font-black uppercase tracking-widest rounded-md bg-violet-50 text-violet-700 border border-violet-100 text-center truncate" title={ref.note || ''}>
+                                      {ref.startChar}-{ref.endChar}
+                                    </span>
+                                  ))}
+                                 </div>
+                               </div>
+                             );
+                           })}
+                         </div>
                        </div>
                      ))}
                    </div>
                  </div>
                  {editingClusterId && (
-                   <ClusterEditor cluster={state.clusters.find(c => c.id === editingClusterId)!} onClose={() => setEditingClusterId(null)} onSave={(updated) => { setState(s => ({ ...s, clusters: s.clusters.map(c => c.id === updated.id ? updated : c) })); setEditingClusterId(null); syncReconciliation(); }} />
+                   <ClusterEditor cluster={state.clusters.find(c => c.id === editingClusterId)!} onClose={() => setEditingClusterId(null)} onSave={(updated) => { commitClusterEdit((clusters) => clusters.map(c => c.id === updated.id ? { ...updated } : c)); setEditingClusterId(null); }} />
                  )}
                  <div className="bg-white border-t p-6 flex justify-center">
                     <button 
