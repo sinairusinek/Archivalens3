@@ -1502,42 +1502,9 @@ const App: React.FC = () => {
                <div className="flex-1 flex flex-col overflow-hidden bg-slate-50">
                  {renderCommonHeader(
                    <div className="flex items-center gap-2 flex-wrap">
-                     <button onClick={() => {
-                         const toProc = state.files.filter(f => f.shouldTranscribe);
-                         if (toProc.length === 0) { alert("Select pages first."); return; }
-                         setState(s => ({ ...s, processingStatus: { total: toProc.length, processed: 0, currentStep: 'Gemini OCR Pipeline...', isComplete: false } }));
-                         (async () => {
-                           const concurrency = state.tier === Tier.PAID ? 5 : 1;
-                           for (let i = 0; i < toProc.length; i += concurrency) {
-                             const batch = toProc.slice(i, i + concurrency);
-                             setState(prev => ({ ...prev, files: prev.files.map(f => batch.some(bp => bp.id === f.id) ? { ...f, status: 'transcribing' } : f) }));
-                             await Promise.all(batch.map(async (p) => {
-                               const res = await transcribeAndTranslatePage(p, state.tier);
-                               setState(prev => ({ ...prev, files: prev.files.map(f => f.id === p.id ? { ...f, ...res, manualTranscription: res.generatedTranscription, status: 'done' } : f), processingStatus: { ...prev.processingStatus, processed: prev.processingStatus.processed + 1 } }));
-                             }));
-                           }
-                           setState(prev => ({ ...prev, processingStatus: { ...prev.processingStatus, isComplete: true } }));
-                         })();
-                       }} className="px-5 py-2.5 rounded-xl text-xs font-black uppercase tracking-widest bg-blue-600 hover:bg-blue-700 text-white flex items-center gap-2 shadow-lg transition-all active:scale-95 disabled:opacity-50" disabled={state.processingStatus.total > 0 && !state.processingStatus.isComplete}><Bot className="w-4 h-4" /> Transcribe</button>
-                     <div className="h-5 w-px bg-slate-200 mx-1" />
                      <button onClick={undoClusterEdit} disabled={clusterPast.length === 0} className="p-2.5 bg-white border border-slate-200 text-slate-500 hover:bg-slate-50 rounded-xl transition-all flex items-center gap-2 text-[10px] font-black uppercase tracking-widest disabled:opacity-30"><RotateCcw className="w-3.5 h-3.5" /> Undo</button>
                      <button onClick={redoClusterEdit} disabled={clusterFuture.length === 0} className="p-2.5 bg-white border border-slate-200 text-slate-500 hover:bg-slate-50 rounded-xl transition-all flex items-center gap-2 text-[10px] font-black uppercase tracking-widest disabled:opacity-30"><RotateCw className="w-3.5 h-3.5" /> Redo</button>
                      <button onClick={keepAllClustersAsFinal} disabled={state.clusters.length === 0} className="p-2.5 bg-emerald-50 border border-emerald-200 text-emerald-700 hover:bg-emerald-100 rounded-xl transition-all flex items-center gap-2 text-[10px] font-black uppercase tracking-widest disabled:opacity-30"><CheckCircle className="w-3.5 h-3.5" /> Keep All</button>
-                     <button onClick={async () => {
-                       setClusterPast([]); setClusterFuture([]);
-                       setState(s => ({ ...s, clusters: [], reconciliationList: [], processingStatus: { total: s.files.length - 1, processed: 0, currentStep: 'Starting document analysis...', isComplete: false } }));
-                       try {
-                         const clusters = await clusterPagesPairwise(
-                           state.files,
-                           state.tier,
-                           5,
-                           (step, done, total) => setState(s => ({ ...s, processingStatus: { total, processed: done, currentStep: step, isComplete: false } }))
-                         );
-                         const normalized = normalizeClusterSet(markClustersAsAiProposed(ensureAllPagesAssigned(clusters, state.files)));
-                         setState(s => ({ ...s, clusters: normalized, reconciliationList: [], processingStatus: { total: normalized.length, processed: normalized.length, currentStep: 'Complete', isComplete: true } }));
-                         setTimeout(() => syncReconciliation(), 0);
-                       } catch (e) { alert("Clustering failed."); setState(s => ({ ...s, processingStatus: { ...s.processingStatus, isComplete: true } })); }
-                     }} className="bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-2.5 rounded-xl text-xs font-black uppercase tracking-tight flex items-center gap-2 shadow-lg disabled:opacity-50 transition-all" disabled={state.processingStatus.total > 0 && !state.processingStatus.isComplete}><Sparkles className="w-4 h-4" /> AI Document Indexing</button>
                    </div>
                  )}
                  
