@@ -10,7 +10,7 @@ import {
   RefreshCw, Maximize, Minimize, User as UserIcon, Zap, Cpu, AlertCircle, ChevronLeft, Trash, ArrowDownAz, ArrowUpAz
 } from 'lucide-react';
 import { ArchivalPage, AppState, AnalysisMode, Tier, ProcessingStatus, Cluster, ClusterPageRef, Correspondent, EntityReference, NamedEntities, ReconciliationRecord, SourceAppearance, DocType } from '../types';
-import { analyzePageContent, transcribeAndTranslatePage, clusterPages } from '../services/geminiService';
+import { analyzePageContent, transcribeAndTranslatePage, clusterPages, reanalyzeClusterMetadata } from '../services/geminiService';
 import { listFilesFromDrive, fetchFileFromDrive, uploadFileToDrive } from '../services/googleDriveService';
 import { generateTSV, generateClustersTSV, generateVocabularyCSV, generateMasterVocabularyCSV, generateFullJSON, generateProjectBackup, generateProjectZip, downloadFile, createImagePreview } from '../utils/fileUtils';
 import { CONTROLLED_VOCABULARY, SUBJECTS_LIST, DOCUMENT_TYPES, PRISON_MASTER_LIST } from '../services/vocabulary';
@@ -396,16 +396,21 @@ const ProcessingBanner: React.FC<{ status: ProcessingStatus }> = ({ status }) =>
   );
 };
 
+
 const App: React.FC = () => {
   const [state, setState] = useState<AppState>(INITIAL_STATE);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [zoomedPageId, setZoomedPageId] = useState<string | null>(null);
+  const [pageViewId, setPageViewId] = useState<string | null>(null);
+  const [pageViewField, setPageViewField] = useState<'manualTranscription' | 'manualDescription' | 'generatedTranslation'>('manualTranscription');
   const [projectTitle, setProjectTitle] = useState<string>("Archival Project");
   const [archiveName, setArchiveName] = useState<string>("");
-  const [expandedField, setExpandedField] = useState<{ pageId: string, field: 'manualTranscription' | 'manualDescription' | 'generatedTranslation', label: string } | null>(null);
   const [editingClusterId, setEditingClusterId] = useState<number | null>(null);
   const [clusterPast, setClusterPast] = useState<Cluster[][]>([]);
   const [clusterFuture, setClusterFuture] = useState<Cluster[][]>([]);
+  const [dirtyClusterIds, setDirtyClusterIds] = useState<Set<number>>(new Set());
+  const [reanalyzingClusterIds, setReanalyzingClusterIds] = useState<Set<number>>(new Set());
+  const [dragReorderState, setDragReorderState] = useState<{ pageId: string; clusterId: number } | null>(null);
+  const [splitMenuState, setSplitMenuState] = useState<{ clusterId: number; pageId: string } | null>(null);
   
   const [isProcessingFiles, setIsProcessingFiles] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
@@ -437,6 +442,15 @@ const App: React.FC = () => {
     if (state.files.length === 0) return;
     syncReconciliation();
   }, [state.clusters, state.files, state.masterVocabulary]);
+
+  useEffect(() => {
+    if (!splitMenuState) return;
+    const close = (e: MouseEvent) => {
+      if (!(e.target as Element).closest('[data-split-menu]')) setSplitMenuState(null);
+    };
+    document.addEventListener('mousedown', close);
+    return () => document.removeEventListener('mousedown', close);
+  }, [splitMenuState]);
 
   const normalizeIndexPart = (value: string): string =>
     String(value || '')
@@ -612,7 +626,8 @@ const App: React.FC = () => {
     }, { markAsHumanReviewed: false });
   };
 
-  const splitClusterAtPage = (clusterId: number, splitAtPageId: string) => {
+  // Split before splitAtPageId → pages from that point become a new document inserted after current
+  const splitClusterNewDoc = (clusterId: number, splitAtPageId: string, duplicatePage: boolean) => {
     commitClusterEdit((clusters) => {
       const index = clusters.findIndex(c => c.id === clusterId);
       if (index < 0) return clusters;
@@ -620,17 +635,61 @@ const App: React.FC = () => {
       const splitIndex = target.pageIds.indexOf(splitAtPageId);
       if (splitIndex <= 0) return clusters;
 
-      const first = { ...target, pageIds: target.pageIds.slice(0, splitIndex) };
+      const firstIds = duplicatePage
+        ? target.pageIds.slice(0, splitIndex + 1)   // keep the boundary page in current
+        : target.pageIds.slice(0, splitIndex);
+      const secondIds = target.pageIds.slice(splitIndex); // boundary page starts the new doc
+
+      const first = { ...target, pageIds: firstIds, pageRefs: (target.pageRefs || []).filter(r => firstIds.includes(r.pageId)) };
       const second = {
         ...target,
+        id: Math.max(...clusters.map(c => c.id)) + 1,
         title: `${target.title} (Part 2)`,
-        pageIds: target.pageIds.slice(splitIndex),
+        reviewStatus: 'human-reviewed' as const,
+        pageIds: secondIds,
+        pageRefs: secondIds.map(pid => ({ pageId: pid, source: 'manual' as const })),
       };
 
       const next = [...clusters];
       next.splice(index, 1, first, second);
       return next;
     });
+    setDirtyClusterIds(prev => { const s = new Set(prev); s.add(clusterId); return s; });
+    setSplitMenuState(null);
+  };
+
+  // Split before splitAtPageId → pages from that point are prepended to the next existing document
+  const splitClusterPrependToNext = (clusterId: number, splitAtPageId: string, duplicatePage: boolean) => {
+    commitClusterEdit((clusters) => {
+      const index = clusters.findIndex(c => c.id === clusterId);
+      if (index < 0 || index >= clusters.length - 1) return clusters;
+      const target = clusters[index];
+      const nextCluster = clusters[index + 1];
+      const splitIndex = target.pageIds.indexOf(splitAtPageId);
+      if (splitIndex <= 0) return clusters;
+
+      const movedIds = target.pageIds.slice(splitIndex); // these go to the next doc
+      const firstIds = duplicatePage
+        ? target.pageIds.slice(0, splitIndex + 1)
+        : target.pageIds.slice(0, splitIndex);
+
+      const updatedFirst = { ...target, pageIds: firstIds, pageRefs: (target.pageRefs || []).filter(r => firstIds.includes(r.pageId)) };
+      const updatedNext = {
+        ...nextCluster,
+        pageIds: [...movedIds, ...nextCluster.pageIds],
+        pageRefs: [
+          ...movedIds.map(pid => ({ pageId: pid, source: 'manual' as const })),
+          ...(nextCluster.pageRefs || []),
+        ],
+      };
+
+      const next = [...clusters];
+      next[index] = updatedFirst;
+      next[index + 1] = updatedNext;
+      return next;
+    });
+    setDirtyClusterIds(prev => { const s = new Set(prev); s.add(clusterId); return s; });
+    setSplitMenuState(null);
   };
 
   const mergeWithPreviousCluster = (clusterId: number) => {
@@ -680,6 +739,7 @@ const App: React.FC = () => {
 
       return removed;
     });
+    setDirtyClusterIds(prev => new Set(prev).add(destinationClusterId));
   };
 
   const copyPageAsPartialToCluster = (pageId: string, destinationClusterId: number, startChar?: number, endChar?: number, note?: string) => {
@@ -836,6 +896,22 @@ const App: React.FC = () => {
         }
       ];
     });
+  };
+
+  const reanalyzeCluster = async (clusterId: number) => {
+    const cluster = state.clusters.find(c => c.id === clusterId);
+    if (!cluster) return;
+    const pages = cluster.pageIds.map(id => state.files.find(f => f.id === id)).filter(Boolean) as ArchivalPage[];
+    setReanalyzingClusterIds(prev => new Set(prev).add(clusterId));
+    try {
+      const updated = await reanalyzeClusterMetadata(cluster, pages, state.tier);
+      commitClusterEdit(clusters => clusters.map(c => c.id === clusterId ? { ...c, ...updated, reviewStatus: 'human-reviewed' as const } : c));
+      setDirtyClusterIds(prev => { const s = new Set(prev); s.delete(clusterId); return s; });
+    } catch (err: any) {
+      alert(`Failed to refresh cluster summary: ${err.message}`);
+    } finally {
+      setReanalyzingClusterIds(prev => { const s = new Set(prev); s.delete(clusterId); return s; });
+    }
   };
 
   const toggleFullscreen = () => {
@@ -1475,7 +1551,7 @@ const App: React.FC = () => {
                              <div className="text-[8px] font-bold text-slate-500 uppercase mt-1">Gemini AI Pipeline</div>
                            </div>
                          )}
-                         <div className="relative aspect-[4/5] overflow-hidden bg-slate-100 cursor-zoom-in" onClick={() => setZoomedPageId(page.id)}>
+                         <div className="relative aspect-[4/5] overflow-hidden bg-slate-100 cursor-zoom-in" onClick={() => setPageViewId(page.id)}>
                              <img src={page.previewUrl} alt={page.indexName} className={`w-full h-full object-cover transition-transform duration-700 group-hover:scale-110 ${page.status === 'transcribing' ? 'grayscale opacity-50' : ''}`} style={{ transform: `rotate(${page.rotation || 0}deg)` }} />
                              <div className="absolute top-4 left-4 flex flex-col gap-2">
                                <div className="bg-white/95 backdrop-blur-sm px-3 py-1.5 rounded-xl text-[10px] font-black text-slate-800 shadow-xl uppercase">{page.indexName.split('-').pop()?.trim()}</div>
@@ -1515,7 +1591,6 @@ const App: React.FC = () => {
                                <input type="checkbox" className="hidden" checked={page.shouldTranscribe} onChange={e => setState(s => ({ ...s, files: s.files.map(f => f.id === page.id ? { ...f, shouldTranscribe: e.target.checked } : f) }))} />
                                <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Mark for OCR</span>
                              </label>
-                             <button onClick={() => setExpandedField({ pageId: page.id, field: 'manualTranscription', label: 'Transcription Editor' })} className="w-full py-2 rounded-xl bg-slate-50 text-[10px] font-black uppercase text-slate-600 hover:bg-slate-900 hover:text-white transition-all border flex items-center justify-center gap-2"><Edit3 className="w-3.5 h-3.5" /> Edit OCR</button>
                            </div>
                          </div>
                        </div>
@@ -1609,7 +1684,7 @@ const App: React.FC = () => {
                                <img
                                  src={page.previewUrl}
                                  className="h-32 w-24 object-cover rounded-xl border cursor-zoom-in hover:scale-105 transition-all shadow-sm"
-                                 onClick={() => setZoomedPageId(page.id)}
+                                 onClick={() => setPageViewId(page.id)}
                                />
                                <button
                                  onClick={() => createClusterFromSinglePage(page.id)}
@@ -1770,17 +1845,65 @@ const App: React.FC = () => {
                               </div>
                             </div>
                          </div>
-                         <div className="mt-12 flex gap-4 overflow-x-auto pb-4 custom-scrollbar">
+                         {/* Refresh AI Summary button — shown when cluster has been manually changed */}
+                         {dirtyClusterIds.has(c.id) && (
+                           <div className="mt-8 flex items-center gap-3 p-4 bg-amber-50 border border-amber-200 rounded-2xl">
+                             <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                             <span className="text-xs font-bold text-amber-700 flex-1">Pages were manually changed. Refresh to update AI summary and metadata.</span>
+                             <button
+                               onClick={() => reanalyzeCluster(c.id)}
+                               disabled={reanalyzingClusterIds.has(c.id)}
+                               className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-[10px] font-black uppercase tracking-widest flex items-center gap-2 transition-all disabled:opacity-50"
+                             >
+                               {reanalyzingClusterIds.has(c.id) ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+                               Refresh AI Summary
+                             </button>
+                           </div>
+                         )}
+                         <div className="mt-12 flex gap-5 overflow-x-auto pb-4 custom-scrollbar">
                            {c.pageIds.map((pid, pageIndexInCluster) => {
                              const p = state.files.find(f => f.id === pid);
                              if (!p) return null;
                              const usageCount = assignedPageCount.get(pid) || 0;
                              const isShared = usageCount > 1;
                              const segmentRefs = (c.pageRefs || []).filter(ref => ref.pageId === pid && typeof ref.startChar === 'number' && typeof ref.endChar === 'number');
+                             const isDragging = dragReorderState?.pageId === pid && dragReorderState?.clusterId === c.id;
                              return (
-                               <div key={pid} className="shrink-0 space-y-2">
-                                 <img src={p.previewUrl} className="h-32 w-24 object-cover rounded-xl border cursor-zoom-in hover:scale-105 transition-all shadow-sm" onClick={() => setZoomedPageId(p.id)} />
-                                 <div className="flex flex-col gap-1 w-24">
+                               <div
+                                 key={pid}
+                                 className={'shrink-0 space-y-2 cursor-move ' + (isDragging ? 'opacity-40' : '')}
+                                 draggable
+                                 onDragStart={() => setDragReorderState({ pageId: pid, clusterId: c.id })}
+                                 onDragEnd={() => setDragReorderState(null)}
+                                 onDragOver={e => e.preventDefault()}
+                                 onDrop={e => {
+                                   e.preventDefault();
+                                   if (dragReorderState && dragReorderState.clusterId === c.id && dragReorderState.pageId !== pid) {
+                                     commitClusterEdit(clusters => clusters.map(cluster => {
+                                       if (cluster.id !== c.id) return cluster;
+                                       const ids = [...cluster.pageIds];
+                                       const from = ids.indexOf(dragReorderState.pageId);
+                                       const to = ids.indexOf(pid);
+                                       ids.splice(from, 1);
+                                       ids.splice(to, 0, dragReorderState.pageId);
+                                       return { ...cluster, pageIds: ids };
+                                     }));
+                                     setDirtyClusterIds(prev => new Set(prev).add(c.id));
+                                   }
+                                   setDragReorderState(null);
+                                 }}
+                               >
+                                 <div className="relative group">
+                                   <img src={p.previewUrl} className="h-64 w-48 object-cover rounded-xl border shadow-sm" />
+                                   <button
+                                     onClick={() => setPageViewId(p.id)}
+                                     className="absolute inset-0 flex items-center justify-center bg-black/0 group-hover:bg-black/40 rounded-xl transition-all opacity-0 group-hover:opacity-100"
+                                   >
+                                     <ZoomIn className="w-8 h-8 text-white drop-shadow" />
+                                   </button>
+                                 </div>
+                                 <div className="flex flex-col gap-1 w-48">
+                                   <span className="text-[10px] font-bold text-slate-600 truncate" title={p.indexName}>{p.indexName}</span>
                                    {isShared && (
                                      <span className="px-1.5 py-0.5 text-[7px] font-black uppercase tracking-widest rounded-md bg-purple-50 text-purple-700 border border-purple-100 text-center">
                                        Shared ({usageCount})
@@ -1791,21 +1914,59 @@ const App: React.FC = () => {
                                        Segments ({segmentRefs.length})
                                      </span>
                                    )}
-                                   {pageIndexInCluster > 0 && (
-                                     <button
-                                       onClick={() => splitClusterAtPage(c.id, pid)}
-                                       className="px-2 py-1 text-[8px] font-black uppercase tracking-widest rounded-lg bg-amber-50 text-amber-700 border border-amber-100 hover:bg-amber-100 transition-all"
-                                     >
-                                       Split Here
-                                     </button>
-                                   )}
+                                   {pageIndexInCluster > 0 && (() => {
+                                     const isOpen = splitMenuState?.clusterId === c.id && splitMenuState?.pageId === pid;
+                                     const nextCluster = state.clusters[state.clusters.findIndex(cl => cl.id === c.id) + 1];
+                                     return (
+                                       <div className="relative" data-split-menu>
+                                         <button
+                                           onClick={() => setSplitMenuState(isOpen ? null : { clusterId: c.id, pageId: pid })}
+                                           className={'px-2 py-1 text-[8px] font-black uppercase tracking-widest rounded-lg border transition-all w-full ' + (isOpen ? 'bg-amber-200 text-amber-900 border-amber-300' : 'bg-amber-50 text-amber-700 border-amber-100 hover:bg-amber-100')}
+                                         >
+                                           Split before…
+                                         </button>
+                                         {isOpen && (
+                                           <div className="absolute left-0 top-full mt-1 z-50 bg-white border border-slate-200 rounded-xl shadow-2xl p-2 flex flex-col gap-1 min-w-[200px]">
+                                             <p className="text-[8px] font-black uppercase tracking-widest text-slate-400 px-2 pb-1 border-b mb-1">
+                                               This page starts the second part
+                                             </p>
+                                             <button onClick={() => splitClusterNewDoc(c.id, pid, false)} className="text-left px-3 py-2 rounded-lg hover:bg-slate-50 text-[10px] font-bold text-slate-700 transition-all">
+                                               <span className="block font-black text-slate-900">→ New document</span>
+                                               <span className="text-slate-400">Pages from here become a new doc</span>
+                                             </button>
+                                             {nextCluster && (
+                                               <button onClick={() => splitClusterPrependToNext(c.id, pid, false)} className="text-left px-3 py-2 rounded-lg hover:bg-slate-50 text-[10px] font-bold text-slate-700 transition-all">
+                                                 <span className="block font-black text-slate-900">→ Prepend to Doc #{nextCluster.id}</span>
+                                                 <span className="text-slate-400 truncate block max-w-[180px]">{nextCluster.title || 'Untitled'}</span>
+                                               </button>
+                                             )}
+                                             <div className="border-t my-1" />
+                                             <p className="text-[8px] font-black uppercase tracking-widest text-purple-400 px-2 pb-1">
+                                               Boundary scan — keep page in both
+                                             </p>
+                                             <button onClick={() => splitClusterNewDoc(c.id, pid, true)} className="text-left px-3 py-2 rounded-lg hover:bg-purple-50 text-[10px] font-bold text-slate-700 transition-all">
+                                               <span className="block font-black text-purple-800">→ New document + duplicate</span>
+                                               <span className="text-slate-400">Page stays here and starts new doc</span>
+                                             </button>
+                                             {nextCluster && (
+                                               <button onClick={() => splitClusterPrependToNext(c.id, pid, true)} className="text-left px-3 py-2 rounded-lg hover:bg-purple-50 text-[10px] font-bold text-slate-700 transition-all">
+                                                 <span className="block font-black text-purple-800">→ Doc #{nextCluster.id} + duplicate</span>
+                                                 <span className="text-slate-400">Page stays here and is added to next doc</span>
+                                               </button>
+                                             )}
+                                             <button onClick={() => setSplitMenuState(null)} className="mt-1 text-center text-[8px] font-black uppercase text-slate-300 hover:text-slate-500 py-1 transition-all">Cancel</button>
+                                           </div>
+                                         )}
+                                       </div>
+                                     );
+                                   })()}
                                    <select
                                      value={c.id}
                                      onChange={(e) => movePageToCluster(pid, parseInt(e.target.value, 10))}
                                      className="px-2 py-1 text-[8px] font-black uppercase tracking-widest rounded-lg bg-slate-50 border border-slate-200 text-slate-600 outline-none"
                                    >
                                      {state.clusters.map(dest => (
-                                       <option key={dest.id} value={dest.id}>Doc #{dest.id}</option>
+                                       <option key={dest.id} value={dest.id}>Doc #{dest.id} — {dest.title || 'Untitled'}</option>
                                      ))}
                                    </select>
                                    <select
@@ -1814,13 +1975,14 @@ const App: React.FC = () => {
                                        const destination = parseInt(e.target.value, 10);
                                        if (!isNaN(destination)) {
                                          promptAndCopySegment(pid, destination);
+                                         setDirtyClusterIds(prev => new Set(prev).add(destination));
                                        }
                                      }}
                                      className="px-2 py-1 text-[8px] font-black uppercase tracking-widest rounded-lg bg-purple-50 border border-purple-100 text-purple-700 outline-none"
                                    >
                                      <option value="">Copy Partial...</option>
                                      {state.clusters.map(dest => (
-                                       <option key={`copy-${dest.id}`} value={dest.id}>Doc #{dest.id}</option>
+                                       <option key={`copy-${dest.id}`} value={dest.id}>Doc #{dest.id} — {dest.title || 'Untitled'}</option>
                                      ))}
                                    </select>
                                   {segmentRefs.slice(0, 2).map((ref, idx) => (
@@ -1864,31 +2026,65 @@ const App: React.FC = () => {
           </div>
         </>
       )}
-      {expandedField && (
-        <div className="fixed inset-0 z-[100] bg-slate-900/95 backdrop-blur-2xl p-8 flex items-center justify-center">
-          <div className="bg-white w-full h-full rounded-[56px] shadow-2xl overflow-hidden flex flex-col">
-            <header className="p-10 border-b flex justify-between items-center shrink-0">
-              <h3 className="text-2xl font-black italic uppercase">{expandedField.label}</h3>
-              <button onClick={() => setExpandedField(null)} className="p-4 hover:bg-slate-100 rounded-2xl transition-all"><X className="w-10 h-10 text-slate-400 hover:text-slate-900" /></button>
-            </header>
-            <div className="flex-1 flex overflow-hidden">
-               <div className="w-1/2 bg-slate-900 p-12 flex items-center justify-center overflow-auto">
-                 <img src={state.files.find(f => f.id === expandedField.pageId)?.previewUrl} alt="Preview" className="max-w-full max-h-full shadow-2xl rounded-lg" style={{ transform: `rotate(${state.files.find(f => f.id === expandedField.pageId)?.rotation || 0}deg)` }} />
-               </div>
-               <div className="w-1/2 p-12 flex flex-col bg-white">
-                  <textarea className="flex-1 border-2 border-slate-100 rounded-[40px] p-10 font-mono text-base outline-none focus:border-blue-500 bg-slate-50 shadow-inner leading-relaxed resize-none" value={(state.files.find(f => f.id === expandedField.pageId) as any)?.[expandedField.field] || ''} dir={getTextDirection((state.files.find(f => f.id === expandedField.pageId) as any)?.[expandedField.field] || '')} onChange={e => setState(s => ({ ...s, files: s.files.map(f => f.id === expandedField.pageId ? { ...f, [expandedField.field]: e.target.value } : f) }))} />
-                  <div className="grid grid-cols-2 gap-4 mt-8">
-                    <button onClick={() => setExpandedField(null)} className="bg-slate-100 text-slate-500 py-5 rounded-[28px] font-black uppercase transition-all hover:bg-slate-200">Cancel</button>
-                    <button onClick={() => setExpandedField(null)} className="bg-slate-900 text-white py-5 rounded-[28px] font-black uppercase shadow-xl transition-all hover:bg-blue-600 active:scale-95">Confirm Review</button>
-                  </div>
-               </div>
+      {pageViewId && (() => {
+        const page = state.files.find(f => f.id === pageViewId);
+        if (!page) return null;
+        const tabs: { key: 'manualTranscription' | 'manualDescription' | 'generatedTranslation'; label: string }[] = [
+          { key: 'manualTranscription', label: 'Transcription' },
+          { key: 'manualDescription', label: 'Description' },
+          { key: 'generatedTranslation', label: 'Translation' },
+        ];
+        return (
+          <div className="fixed inset-0 z-[110] bg-slate-900 flex overflow-hidden">
+            {/* Large image panel — ~70% width */}
+            <div className="flex-1 flex items-center justify-center p-8 overflow-auto">
+              <img
+                src={page.previewUrl}
+                alt={page.indexName}
+                className="max-w-full max-h-full object-contain shadow-2xl rounded"
+                style={{ transform: `rotate(${page.rotation || 0}deg)` }}
+              />
+            </div>
+            {/* Editor panel — fixed 380px */}
+            <div className="w-[380px] shrink-0 bg-white flex flex-col border-l border-slate-200 overflow-hidden">
+              <header className="px-6 py-5 border-b flex items-start justify-between gap-3 shrink-0">
+                <div>
+                  <p className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-0.5">{page.indexName}</p>
+                  {page.language && <span className="text-[8px] font-black uppercase bg-blue-50 text-blue-600 border border-blue-100 px-2 py-0.5 rounded">{page.language}</span>}
+                </div>
+                <button onClick={() => setPageViewId(null)} className="shrink-0 p-2 hover:bg-slate-100 rounded-xl transition-all">
+                  <X className="w-5 h-5 text-slate-400 hover:text-slate-900" />
+                </button>
+              </header>
+              {/* Tabs */}
+              <div className="flex border-b shrink-0">
+                {tabs.map(tab => (
+                  <button
+                    key={tab.key}
+                    onClick={() => setPageViewField(tab.key)}
+                    className={'flex-1 py-3 text-[9px] font-black uppercase tracking-widest transition-all ' + (pageViewField === tab.key ? 'border-b-2 border-blue-600 text-blue-600' : 'text-slate-400 hover:text-slate-700')}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+              {/* Textarea */}
+              <textarea
+                className="flex-1 p-6 font-mono text-sm outline-none bg-slate-50 leading-relaxed resize-none border-0"
+                value={(page as any)[pageViewField] || ''}
+                dir={getTextDirection((page as any)[pageViewField] || '')}
+                placeholder={`No ${tabs.find(t => t.key === pageViewField)?.label.toLowerCase()} yet…`}
+                onChange={e => setState(s => ({ ...s, files: s.files.map(f => f.id === pageViewId ? { ...f, [pageViewField]: e.target.value } : f) }))}
+              />
+              <div className="p-4 border-t shrink-0">
+                <button onClick={() => setPageViewId(null)} className="w-full py-3 bg-slate-900 text-white rounded-2xl font-black uppercase text-xs tracking-widest hover:bg-blue-600 transition-all active:scale-95">
+                  Done
+                </button>
+              </div>
             </div>
           </div>
-        </div>
-      )}
-      {zoomedPageId && (
-        <div className="fixed inset-0 z-[110] bg-slate-900/98 backdrop-blur-2xl flex items-center justify-center p-12 cursor-zoom-out" onClick={() => setZoomedPageId(null)}><img src={state.files.find(f => f.id === zoomedPageId)?.previewUrl} alt="Zoomed" className="max-w-full max-h-full object-contain shadow-2xl rounded-sm transition-transform" style={{ transform: `rotate(${state.files.find(f => f.id === zoomedPageId)?.rotation || 0}deg)` }} /></div>
-      )}
+        );
+      })()}
       <div className="fixed bottom-6 right-6 flex flex-col gap-2 pointer-events-none items-end z-50">
         <div className="pointer-events-auto group">
           <button onClick={() => { const json = generateFullJSON(projectTitle, archiveName || "Unassigned", state.userName || "Unknown", state.tier, null, state.files, state.clusters); downloadFile(json, `${projectTitle}_analysis.json`, 'application/json'); }} className="flex items-center gap-3 px-6 py-3 bg-white text-slate-900 border border-slate-200 rounded-full shadow-2xl hover:bg-slate-900 hover:text-white transition-all transform hover:-translate-y-1"><FileJson className="w-5 h-5 text-blue-500 group-hover:text-blue-400" /><span className="text-xs font-black uppercase tracking-widest">Export Full Analysis</span></button>

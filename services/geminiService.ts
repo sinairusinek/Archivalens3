@@ -435,6 +435,87 @@ export const clusterPages = async (pages: ArchivalPage[], tier: Tier): Promise<C
     }));
   };
 
-  try { return await runClustering(modelName); } 
+  try { return await runClustering(modelName); }
   catch (e) { if (modelName === "gemini-3-pro-preview") return await runClustering("gemini-3-flash-preview"); throw e; }
+};
+
+export const reanalyzeClusterMetadata = async (cluster: Cluster, pages: ArchivalPage[], tier: Tier): Promise<Partial<Cluster>> => {
+  const modelName = tier === Tier.FREE ? "gemini-3-flash-preview" : "gemini-3-pro-preview";
+  const vocabSummary = CONTROLLED_VOCABULARY.map(v => v.name).join('|');
+  const docTypesSummary = DOCUMENT_TYPES.map(d => d.name).join('|');
+  const prisonsSummary = PRISON_MASTER_LIST.map(p => p.name).join('|');
+  const inputData = pages.map(p => ({
+    id: p.id,
+    indexName: p.indexName,
+    language: p.language,
+    transcription: (p.manualTranscription || p.generatedTranscription || "").slice(0, 15000),
+  }));
+
+  const prompt = `
+    TASK: RE-ANALYZE A SINGLE ARCHIVAL DOCUMENT CLUSTER
+    The user has manually adjusted the page composition of this document. Re-generate its metadata based on the current pages.
+
+    For this cluster return:
+    - title: Descriptive title.
+    - pageRange: e.g. "Page 1-3".
+    - summary: 1–5 sentences relative to the document's length, richness and complexity.
+    - senders: array of {name, role, organizationCategory, nationality}.
+    - recipients: array of {name, role, organizationCategory, nationality}.
+    - entities: { people: [{name, organizationCategory, nationality}], organizations: [{name}], prisons: [{name}], roles: [{name}] }
+    - docTypes: select from [${docTypesSummary}].
+    - subjects: select from [${SUBJECTS_LIST.join('|')}].
+    - originalDate: date as it appears in the document.
+    - standardizedDate: ISO date (YYYY-MM-DD) if determinable.
+    - prisonName: primary prison mentioned, using [${prisonsSummary}].
+
+    NATIONALITY rule: "Arab", "British", "German", "Jew", or "Other".
+
+    Input pages:
+    ${JSON.stringify(inputData)}
+  `;
+
+  const response = await generateContentWithRetry({
+    model: modelName,
+    contents: prompt,
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          title: { type: Type.STRING },
+          pageRange: { type: Type.STRING },
+          summary: { type: Type.STRING },
+          originalDate: { type: Type.STRING },
+          standardizedDate: { type: Type.STRING },
+          prisonName: { type: Type.STRING },
+          docTypes: { type: Type.ARRAY, items: { type: Type.STRING } },
+          subjects: { type: Type.ARRAY, items: { type: Type.STRING } },
+          senders: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { name: { type: Type.STRING }, role: { type: Type.STRING }, organizationCategory: { type: Type.STRING }, nationality: { type: Type.STRING } }, required: ["name"] } },
+          recipients: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { name: { type: Type.STRING }, role: { type: Type.STRING }, organizationCategory: { type: Type.STRING }, nationality: { type: Type.STRING } }, required: ["name"] } },
+          entities: { type: Type.OBJECT, properties: {
+            people: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { name: { type: Type.STRING }, organizationCategory: { type: Type.STRING }, nationality: { type: Type.STRING } } } },
+            organizations: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { name: { type: Type.STRING } } } },
+            prisons: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { name: { type: Type.STRING } } } },
+            roles: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { name: { type: Type.STRING } } } },
+          }, required: ["people", "organizations", "prisons", "roles"] },
+        },
+        required: ["title", "summary"],
+      },
+    },
+  });
+
+  const raw = JSON.parse(response.text || "{}");
+  const mapName = (x: any) => { const rawName = String(x?.name || "").trim(); const r = resolveVocabularyMatch(rawName); return { ...x, name: rawName, id: r.id, rawName, normalizedName: r.normalizedName, mappingMethod: r.mappingMethod }; };
+  return {
+    ...raw,
+    docTypes: (raw.docTypes || []).map((name: string) => findDocTypeByName(name)).filter(Boolean),
+    senders: (raw.senders || []).map(mapName),
+    recipients: (raw.recipients || []).map(mapName),
+    entities: {
+      people: (raw.entities?.people || []).map(mapName),
+      organizations: (raw.entities?.organizations || []).map(mapName),
+      prisons: (raw.entities?.prisons || []).map(mapName),
+      roles: (raw.entities?.roles || []).map(mapName),
+    },
+  };
 };
