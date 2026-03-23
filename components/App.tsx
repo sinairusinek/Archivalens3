@@ -1133,12 +1133,12 @@ const App: React.FC = () => {
     if (!e.target.files?.length) return;
     setIsProcessingFiles(true);
     let fileList = Array.from(e.target.files) as File[];
-    
+
     // NATURAL SORTING of files by name to ensure sequence is correct (Page 1, Page 2, Page 10 etc.)
     fileList.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
 
     const allExtractedPages: ArchivalPage[] = [];
-    
+
     let derivedTitle = ((fileList[0] as any).webkitRelativePath?.split('/')[0]) || fileList[0].name.replace(/\.[^/.]+$/, "");
     setProjectTitle(derivedTitle);
 
@@ -1206,7 +1206,42 @@ const App: React.FC = () => {
       }
     }
 
-    setState(s => ({ ...s, mode, files: allExtractedPages.map((f, i) => ensurePageIndexMetadata(f, i + 1)), uiState: 'config' }));
+    // Step 1: Run OCR and transcription for all pages
+    const processedPages: ArchivalPage[] = [];
+    for (let i = 0; i < allExtractedPages.length; i++) {
+      let page = allExtractedPages[i];
+      try {
+        setState(s => ({ ...s, processingStatus: { total: allExtractedPages.length, processed: i, currentStep: `Analyzing page ${i+1}`, isComplete: false } }));
+        const analysis = await analyzePageContent(page, Tier.FREE);
+        page = { ...page, ...analysis, status: analysis.status || 'analyzed' };
+        setState(s => ({ ...s, processingStatus: { total: allExtractedPages.length, processed: i, currentStep: `Transcribing page ${i+1}`, isComplete: false } }));
+        const transcription = await transcribeAndTranslatePage(page, Tier.FREE);
+        page = { ...page, ...transcription, status: transcription.status || 'done' };
+      } catch (err) {
+        page = { ...page, status: 'error', error: (err as any)?.message || 'Processing failed' };
+      }
+      processedPages.push(page);
+    }
+
+    // Step 2: Run clustering/indexing
+    setState(s => ({ ...s, processingStatus: { total: 1, processed: 0, currentStep: 'Clustering documents', isComplete: false } }));
+    let clusters: Cluster[] = [];
+    try {
+      clusters = await clusterPagesPairwise(processedPages, Tier.FREE);
+    } catch (err) {
+      console.error('Clustering failed', err);
+    }
+
+    // Step 3: Save project locally
+    setState(s => ({ ...s, mode, files: processedPages, clusters, uiState: 'dashboard', processingStatus: { total: 1, processed: 1, currentStep: 'Saving project', isComplete: false } }));
+    try {
+      const zipBlob = await generateProjectZip({ ...INITIAL_STATE, files: processedPages, clusters }, derivedTitle, '', null);
+      downloadFile(zipBlob, `${derivedTitle}.aln_project.zip`, 'application/zip');
+    } catch (err) {
+      console.error('Project save failed', err);
+    }
+
+    setState(s => ({ ...s, processingStatus: { total: 1, processed: 1, currentStep: 'Complete', isComplete: true } }));
     setIsProcessingFiles(false);
   };
 
