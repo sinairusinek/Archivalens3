@@ -747,6 +747,7 @@ const App: React.FC = () => {
 
       const next = [...clusters];
       next.splice(index - 1, 2, merged);
+      setDirtyClusterIds(prev => new Set(prev).add(merged.id));
       return next;
     });
   };
@@ -1540,111 +1541,6 @@ const App: React.FC = () => {
                    </div>
                  )}
                  
-                 <div className="bg-white border-b px-8 py-3 flex flex-wrap items-center justify-between gap-4">
-                    <div className="flex items-center gap-6">
-                      <label className="flex items-center gap-2 cursor-pointer group">
-                        <div className={`w-5 h-5 rounded border flex items-center justify-center transition-all ${filteredPages.length > 0 && filteredPages.every(p => p.shouldTranscribe) ? 'bg-slate-900 border-slate-900' : 'bg-white border-slate-300'}`}>
-                          {filteredPages.length > 0 && filteredPages.every(p => p.shouldTranscribe) && <Check className="w-3.5 h-3.5 text-white" />}
-                        </div>
-                        <input type="checkbox" className="hidden" onChange={e => handleSelectAll(e.target.checked)} checked={filteredPages.length > 0 && filteredPages.every(p => p.shouldTranscribe)} />
-                        <span className="text-[10px] font-black uppercase tracking-widest text-slate-500">Select Filtered ({filteredPages.length})</span>
-                      </label>
-                      <div className="h-4 w-px bg-slate-200" />
-                      <div className="flex items-center gap-2">
-                         <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">Range:</span>
-                         <input type="number" value={rangeStart} onChange={e => setRangeStart(e.target.value)} className="w-16 px-2 py-1 bg-slate-50 border rounded text-xs font-bold text-center" />
-                         <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">to</span>
-                         <input type="number" value={rangeEnd} onChange={e => setRangeEnd(e.target.value)} className="w-16 px-2 py-1 bg-slate-50 border rounded text-xs font-bold text-center" />
-                         <button onClick={handleRangeSelect} className="ml-2 px-3 py-1 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded text-[10px] font-black uppercase transition-all">Apply</button>
-                      </div>
-                    </div>
-                    
-                    <div className="flex items-center gap-4">
-                      <div className="flex items-center gap-2 group relative">
-                        <ArrowDownAz className="w-3.5 h-3.5 text-slate-400" />
-                        <select onChange={e => handleManualSort(e.target.value as any)} className="bg-slate-50 border rounded-lg px-3 py-1.5 text-[10px] font-black uppercase text-slate-600 outline-none focus:border-blue-500 cursor-pointer">
-                          <option value="">Sort By...</option>
-                          <option value="filename-asc">Filename (A-Z)</option>
-                          <option value="filename-desc">Filename (Z-A)</option>
-                          <option value="status">Process Status</option>
-                        </select>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <Filter className="w-3.5 h-3.5 text-slate-400" />
-                        <select value={filterProductionMode} onChange={e => setFilterProductionMode(e.target.value)} className="bg-slate-50 border rounded-lg px-3 py-1.5 text-[10px] font-black uppercase text-slate-600 outline-none focus:border-blue-500">
-                          <option value="All">All Text Types</option>
-                          {productionModes.map(m => <option key={m} value={m}>{m}</option>)}
-                        </select>
-                        <select value={filterConfidence} onChange={e => setFilterConfidence(e.target.value)} className="bg-slate-50 border rounded-lg px-3 py-1.5 text-[10px] font-black uppercase text-slate-600 outline-none focus:border-blue-500">
-                          <option value="All">All Quality</option>
-                          <option value="Low Certainty">Low Certainty</option>
-                          <option value="High Certainty">High Certainty</option>
-                        </select>
-                      </div>
-                      <div className="relative">
-                        <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400" />
-                        <input type="text" placeholder="Search pages..." value={searchTerm} onChange={e => setSearchTerm(e.target.value)} className="pl-9 pr-4 py-1.5 bg-slate-50 border rounded-lg text-xs font-medium w-48 focus:border-blue-500 outline-none" />
-                      </div>
-                    </div>
-                 </div>
-
-                 <div className="flex-1 overflow-auto p-8 custom-scrollbar">
-                   <div className="max-w-[1500px] mx-auto grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-8">
-                     {filteredPages.map(page => (
-                       <div key={page.id} className="bg-white rounded-[32px] border overflow-hidden group hover:border-blue-500 hover:shadow-2xl transition-all flex flex-col shadow-sm relative">
-                         {page.status === 'transcribing' && (
-                           <div className="absolute inset-0 z-10 bg-white/60 backdrop-blur-[2px] flex flex-col items-center justify-center p-6 text-center animate-in fade-in duration-300">
-                             <Loader2 className="w-10 h-10 text-blue-600 animate-spin mb-3" />
-                             <div className="text-[10px] font-black uppercase tracking-widest text-slate-900">Transcribing...</div>
-                             <div className="text-[8px] font-bold text-slate-500 uppercase mt-1">Gemini AI Pipeline</div>
-                           </div>
-                         )}
-                         <div className="relative aspect-[4/5] overflow-hidden bg-slate-100 cursor-zoom-in" onClick={() => setPageViewId(page.id)}>
-                             <img src={page.previewUrl} alt={page.indexName} className={`w-full h-full object-cover transition-transform duration-700 group-hover:scale-110 ${page.status === 'transcribing' ? 'grayscale opacity-50' : ''}`} style={{ transform: `rotate(${page.rotation || 0}deg)` }} />
-                             <div className="absolute top-4 left-4 flex flex-col gap-2">
-                               <div className="bg-white/95 backdrop-blur-sm px-3 py-1.5 rounded-xl text-[10px] font-black text-slate-800 shadow-xl uppercase">{page.indexName.split('-').pop()?.trim()}</div>
-                               {page.productionMode && (
-                                 <div className={`px-2 py-1 rounded-lg text-[8px] font-black uppercase tracking-tight shadow-lg w-fit ${
-                                   page.productionMode === 'Handwritten' ? 'bg-amber-400 text-amber-950' :
-                                   page.productionMode === 'Printed' ? 'bg-blue-500 text-white' :
-                                   page.productionMode === 'Typewritten' ? 'bg-indigo-600 text-white' :
-                                   page.productionMode === 'No Text' ? 'bg-slate-400 text-white' :
-                                   'bg-purple-500 text-white'
-                                 }`}>
-                                   {page.productionMode}
-                                 </div>
-                               )}
-                             </div>
-                             {page.confidenceScore !== undefined && page.confidenceScore <= 2 && (
-                               <div className="absolute top-4 right-4 bg-red-500 text-white p-1.5 rounded-full shadow-lg border-2 border-white animate-pulse" title="Low confidence transcription">
-                                  <AlertCircle className="w-3 h-3" />
-                               </div>
-                             )}
-                         </div>
-                         <div className="p-6 flex flex-col gap-5">
-                           <div>
-                             <h4 className="font-black text-slate-800 truncate text-sm tracking-tight mb-1">{page.indexName}</h4>
-                             <div className="flex flex-wrap gap-1">
-                               <span className="text-[8px] font-black uppercase tracking-widest text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded border">{page.language || '...'}</span>
-                               {page.confidenceScore !== undefined && (
-                                 <span className={`text-[8px] font-black uppercase tracking-widest px-1.5 py-0.5 rounded border ${page.confidenceScore <= 2 ? 'bg-red-50 text-red-600 border-red-100' : 'bg-emerald-50 text-emerald-600 border-emerald-100'}`}>
-                                   Conf: {page.confidenceScore}/5
-                                 </span>
-                               )}
-                             </div>
-                           </div>
-                           <div className="mt-auto pt-5 border-t flex flex-col gap-4">
-                             <label className="flex items-center gap-2 cursor-pointer select-none group/cb">
-                               <div className={`w-5 h-5 rounded-lg border flex items-center justify-center transition-all ${page.shouldTranscribe ? 'bg-blue-600 border-blue-600' : 'bg-white border-slate-300'}`}>{page.shouldTranscribe && <CheckSquare className="w-4 h-4 text-white" />}</div>
-                               <input type="checkbox" className="hidden" checked={page.shouldTranscribe} onChange={e => setState(s => ({ ...s, files: s.files.map(f => f.id === page.id ? { ...f, shouldTranscribe: e.target.checked } : f) }))} />
-                               <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Mark for OCR</span>
-                             </label>
-                           </div>
-                         </div>
-                       </div>
-                     ))}
-                   </div>
-                 </div>
                  
                  <div className="flex-1 p-8 overflow-y-auto custom-scrollbar">
                    <div className="max-w-7xl mx-auto space-y-12">
