@@ -10,7 +10,7 @@ import {
   RefreshCw, Maximize, Minimize, User as UserIcon, Zap, Cpu, AlertCircle, ChevronLeft, Trash, ArrowDownAz, ArrowUpAz
 } from 'lucide-react';
 import { ArchivalPage, AppState, AnalysisMode, Tier, ProcessingStatus, Cluster, ClusterPageRef, Correspondent, EntityReference, NamedEntities, ReconciliationRecord, SourceAppearance, DocType } from '../types';
-import { analyzePageContent, transcribeAndTranslatePage, clusterPages, reanalyzeClusterMetadata } from '../services/geminiService';
+import { analyzePageContent, transcribeAndTranslatePage, reanalyzeClusterMetadata, clusterPagesPairwise } from '../services/geminiService';
 import { listFilesFromDrive, fetchFileFromDrive, uploadFileToDrive } from '../services/googleDriveService';
 import { generateTSV, generateClustersTSV, generateVocabularyCSV, generateMasterVocabularyCSV, generateFullJSON, generateProjectBackup, generateProjectZip, downloadFile, createImagePreview } from '../utils/fileUtils';
 import { CONTROLLED_VOCABULARY, SUBJECTS_LIST, DOCUMENT_TYPES, PRISON_MASTER_LIST } from '../services/vocabulary';
@@ -411,6 +411,8 @@ const App: React.FC = () => {
   const [reanalyzingClusterIds, setReanalyzingClusterIds] = useState<Set<number>>(new Set());
   const [dragReorderState, setDragReorderState] = useState<{ pageId: string; clusterId: number } | null>(null);
   const [splitMenuState, setSplitMenuState] = useState<{ clusterId: number; pageId: string } | null>(null);
+  const [pagesCollapsed, setPagesCollapsed] = useState(() => false);
+  const prevClusterCountRef = useRef(0);
   
   const [isProcessingFiles, setIsProcessingFiles] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
@@ -442,6 +444,11 @@ const App: React.FC = () => {
     if (state.files.length === 0) return;
     syncReconciliation();
   }, [state.clusters, state.files, state.masterVocabulary]);
+
+  useEffect(() => {
+    if (prevClusterCountRef.current === 0 && state.clusters.length > 0) setPagesCollapsed(true);
+    prevClusterCountRef.current = state.clusters.length;
+  }, [state.clusters.length]);
 
   useEffect(() => {
     if (!splitMenuState) return;
@@ -557,6 +564,39 @@ const App: React.FC = () => {
           pageRange: buildPageRangeFromIds(uniquePageIds),
         };
       });
+  };
+
+  // Safety net: any page not yet in a cluster gets grouped into fallback clusters
+  const ensureAllPagesAssigned = (clusters: Cluster[], allPages: ArchivalPage[]): Cluster[] => {
+    const assigned = new Set(clusters.flatMap(c => c.pageIds));
+    const missing = allPages.filter(p => !assigned.has(p.id));
+    if (missing.length === 0) return clusters;
+    // Group consecutive missing pages (by pageOrderMap position) together
+    const sorted = [...missing].sort((a, b) => (pageOrderMap.get(a.id) ?? 0) - (pageOrderMap.get(b.id) ?? 0));
+    const groups: ArchivalPage[][] = [];
+    let group: ArchivalPage[] = [sorted[0]];
+    for (let i = 1; i < sorted.length; i++) {
+      const prevOrder = pageOrderMap.get(sorted[i - 1].id) ?? 0;
+      const currOrder = pageOrderMap.get(sorted[i].id) ?? 0;
+      if (currOrder === prevOrder + 1) { group.push(sorted[i]); }
+      else { groups.push(group); group = [sorted[i]]; }
+    }
+    groups.push(group);
+    const maxId = clusters.reduce((m, c) => Math.max(m, c.id), 0);
+    const fallbacks: Cluster[] = groups.map((g, i) => ({
+      id: maxId + i + 1,
+      title: `Unclustered Pages (${g.map(p => p.indexName).join(', ')})`,
+      pageRange: '',
+      summary: 'Pages not assigned by AI — please review.',
+      pageIds: g.map(p => p.id),
+      pageRefs: g.map(p => ({ pageId: p.id, source: 'ai' as const })),
+      reviewStatus: 'ai-proposed' as const,
+      aiConfidence: 1,
+      boundaryReasons: ['not assigned by AI'],
+      senders: [], recipients: [],
+      entities: { people: [], organizations: [], prisons: [], roles: [] },
+    }));
+    return [...clusters, ...fallbacks];
   };
 
   const markClustersAsAiProposed = (clusters: Cluster[]): Cluster[] => {
@@ -901,7 +941,7 @@ const App: React.FC = () => {
   const reanalyzeCluster = async (clusterId: number) => {
     const cluster = state.clusters.find(c => c.id === clusterId);
     if (!cluster) return;
-    const pages = cluster.pageIds.map(id => state.files.find(f => f.id === id)).filter(Boolean) as ArchivalPage[];
+    const pages = cluster.pageIds.map(id => state.files.find(f => f.id === id)).filter((p): p is ArchivalPage => !!p && !p.irrelevant);
     setReanalyzingClusterIds(prev => new Set(prev).add(clusterId));
     try {
       const updated = await reanalyzeClusterMetadata(cluster, pages, state.tier);
@@ -1070,7 +1110,7 @@ const App: React.FC = () => {
       c.recipients?.forEach(r => add(r.name, 'person', `Doc #${c.id}`));
     });
 
-    state.files.forEach(f => {
+    state.files.filter(f => !f.irrelevant).forEach(f => {
       f.entities?.people?.forEach(p => add(p.name, 'person', f.indexName));
       f.entities?.organizations?.forEach(o => add(o.name, 'organization', f.indexName));
       f.entities?.roles?.forEach(r => add(r.name, 'role', f.indexName));
@@ -1216,8 +1256,7 @@ const App: React.FC = () => {
 
   const renderCommonHeader = (actions?: React.ReactNode) => {
     const views = [
-      { id: 'dashboard', label: 'Pages', icon: LayoutGrid },
-      { id: 'clustering', label: 'Documents', icon: Layers },
+      { id: 'dashboard', label: 'Pages & Documents', icon: Layers },
       { id: 'entities', label: 'Research Index', icon: Fingerprint }
     ];
 
@@ -1374,16 +1413,15 @@ const App: React.FC = () => {
                 <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Workflow Stage</h4>
                 <div className="space-y-2">
                   {[
-                    { id: 'dashboard', label: '1. Page OCR & Review', icon: FileSearch },
-                    { id: 'clustering', label: '2. Document Indexing', icon: Layers },
-                    { id: 'entities', label: '3. Entity Reconciliation', icon: Users }
+                    { id: 'dashboard', label: '1. Pages & Documents', icon: Layers },
+                    { id: 'entities', label: '2. Entity Reconciliation', icon: Users }
                   ].map(step => (
-                    <button 
-                      key={step.id} 
+                    <button
+                      key={step.id}
                       onClick={() => setState(s => ({ ...s, uiState: step.id as any }))}
-                      className={`w-full flex items-center gap-3 px-4 py-3 rounded-2xl text-xs font-black uppercase tracking-tight transition-all border ${state.uiState === step.id ? 'bg-slate-900 text-white border-slate-900 shadow-lg translate-x-1' : 'bg-white text-slate-500 border-transparent hover:bg-slate-50'}`}
+                      className={`w-full flex items-center gap-3 px-4 py-3 rounded-2xl text-xs font-black uppercase tracking-tight transition-all border ${(state.uiState === step.id || (step.id === 'dashboard' && state.uiState === 'clustering')) ? 'bg-slate-900 text-white border-slate-900 shadow-lg translate-x-1' : 'bg-white text-slate-500 border-transparent hover:bg-slate-50'}`}
                     >
-                      <step.icon className={`w-4 h-4 ${state.uiState === step.id ? 'text-blue-400' : 'text-slate-300'}`} />
+                      <step.icon className={`w-4 h-4 ${(state.uiState === step.id || (step.id === 'dashboard' && state.uiState === 'clustering')) ? 'text-blue-400' : 'text-slate-300'}`} />
                       {step.label}
                     </button>
                   ))}
@@ -1459,36 +1497,46 @@ const App: React.FC = () => {
                    </div>
                 </div>
              )}
-             {state.uiState === 'dashboard' && (
+             {(state.uiState === 'dashboard' || state.uiState === 'clustering') && (
                <div className="flex-1 flex flex-col overflow-hidden bg-slate-50">
                  {renderCommonHeader(
-                   <div className="flex items-center gap-3">
+                   <div className="flex items-center gap-2 flex-wrap">
                      <button onClick={() => {
                          const toProc = state.files.filter(f => f.shouldTranscribe);
                          if (toProc.length === 0) { alert("Select pages first."); return; }
                          setState(s => ({ ...s, processingStatus: { total: toProc.length, processed: 0, currentStep: 'Gemini OCR Pipeline...', isComplete: false } }));
-                         
                          (async () => {
                            const concurrency = state.tier === Tier.PAID ? 5 : 1;
                            for (let i = 0; i < toProc.length; i += concurrency) {
                              const batch = toProc.slice(i, i + concurrency);
-                             setState(prev => ({
-                               ...prev,
-                               files: prev.files.map(f => batch.some(bp => bp.id === f.id) ? { ...f, status: 'transcribing' } : f)
-                             }));
-
+                             setState(prev => ({ ...prev, files: prev.files.map(f => batch.some(bp => bp.id === f.id) ? { ...f, status: 'transcribing' } : f) }));
                              await Promise.all(batch.map(async (p) => {
                                const res = await transcribeAndTranslatePage(p, state.tier);
-                               setState(prev => ({ 
-                                 ...prev, 
-                                 files: prev.files.map(f => f.id === p.id ? { ...f, ...res, manualTranscription: res.generatedTranscription, status: 'done' } : f), 
-                                 processingStatus: { ...prev.processingStatus, processed: prev.processingStatus.processed + 1 } 
-                               }));
+                               setState(prev => ({ ...prev, files: prev.files.map(f => f.id === p.id ? { ...f, ...res, manualTranscription: res.generatedTranscription, status: 'done' } : f), processingStatus: { ...prev.processingStatus, processed: prev.processingStatus.processed + 1 } }));
                              }));
                            }
                            setState(prev => ({ ...prev, processingStatus: { ...prev.processingStatus, isComplete: true } }));
                          })();
-                       }} className="px-6 py-2.5 rounded-2xl text-xs font-black uppercase tracking-widest bg-blue-600 hover:bg-blue-700 text-white flex items-center gap-2 shadow-xl transition-all active:scale-95 disabled:opacity-50" disabled={state.processingStatus.total > 0 && !state.processingStatus.isComplete}><Bot className="w-4 h-4" /> Transcribe Selection</button>
+                       }} className="px-5 py-2.5 rounded-xl text-xs font-black uppercase tracking-widest bg-blue-600 hover:bg-blue-700 text-white flex items-center gap-2 shadow-lg transition-all active:scale-95 disabled:opacity-50" disabled={state.processingStatus.total > 0 && !state.processingStatus.isComplete}><Bot className="w-4 h-4" /> Transcribe</button>
+                     <div className="h-5 w-px bg-slate-200 mx-1" />
+                     <button onClick={undoClusterEdit} disabled={clusterPast.length === 0} className="p-2.5 bg-white border border-slate-200 text-slate-500 hover:bg-slate-50 rounded-xl transition-all flex items-center gap-2 text-[10px] font-black uppercase tracking-widest disabled:opacity-30"><RotateCcw className="w-3.5 h-3.5" /> Undo</button>
+                     <button onClick={redoClusterEdit} disabled={clusterFuture.length === 0} className="p-2.5 bg-white border border-slate-200 text-slate-500 hover:bg-slate-50 rounded-xl transition-all flex items-center gap-2 text-[10px] font-black uppercase tracking-widest disabled:opacity-30"><RotateCw className="w-3.5 h-3.5" /> Redo</button>
+                     <button onClick={keepAllClustersAsFinal} disabled={state.clusters.length === 0} className="p-2.5 bg-emerald-50 border border-emerald-200 text-emerald-700 hover:bg-emerald-100 rounded-xl transition-all flex items-center gap-2 text-[10px] font-black uppercase tracking-widest disabled:opacity-30"><CheckCircle className="w-3.5 h-3.5" /> Keep All</button>
+                     <button onClick={async () => {
+                       setClusterPast([]); setClusterFuture([]);
+                       setState(s => ({ ...s, clusters: [], reconciliationList: [], processingStatus: { total: s.files.length - 1, processed: 0, currentStep: 'Starting document analysis...', isComplete: false } }));
+                       try {
+                         const clusters = await clusterPagesPairwise(
+                           state.files,
+                           state.tier,
+                           5,
+                           (step, done, total) => setState(s => ({ ...s, processingStatus: { total, processed: done, currentStep: step, isComplete: false } }))
+                         );
+                         const normalized = normalizeClusterSet(markClustersAsAiProposed(ensureAllPagesAssigned(clusters, state.files)));
+                         setState(s => ({ ...s, clusters: normalized, reconciliationList: [], processingStatus: { total: normalized.length, processed: normalized.length, currentStep: 'Complete', isComplete: true } }));
+                         setTimeout(() => syncReconciliation(), 0);
+                       } catch (e) { alert("Clustering failed."); setState(s => ({ ...s, processingStatus: { ...s.processingStatus, isComplete: true } })); }
+                     }} className="bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-2.5 rounded-xl text-xs font-black uppercase tracking-tight flex items-center gap-2 shadow-lg disabled:opacity-50 transition-all" disabled={state.processingStatus.total > 0 && !state.processingStatus.isComplete}><Sparkles className="w-4 h-4" /> AI Document Indexing</button>
                    </div>
                  )}
                  
@@ -1598,49 +1646,7 @@ const App: React.FC = () => {
                    </div>
                  </div>
                  
-                 <div className="bg-white border-t p-6 flex justify-center">
-                    <button 
-                      onClick={() => setState(s => ({ ...s, uiState: 'clustering' }))}
-                      className="px-8 py-4 bg-slate-900 text-white rounded-[24px] font-black uppercase italic tracking-tight text-sm shadow-2xl flex items-center gap-3 hover:bg-blue-600 transition-all active:scale-95 group"
-                    >
-                      Process Documents Index
-                      <ChevronRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
-                    </button>
-                 </div>
-               </div>
-             )}
-             {state.uiState === 'clustering' && (
-               <div className="flex-1 flex flex-col overflow-hidden bg-slate-50">
-                 {renderCommonHeader(
-                    <div className="flex items-center gap-2">
-                        <button onClick={() => setState(s => ({ ...s, uiState: 'dashboard' }))} className="p-2.5 bg-white border border-slate-200 text-slate-500 hover:bg-slate-50 rounded-xl transition-all flex items-center gap-2 text-[10px] font-black uppercase tracking-widest">
-                            <ChevronLeft className="w-3.5 h-3.5" /> Back to Pages
-                        </button>
-                        <button onClick={undoClusterEdit} disabled={clusterPast.length === 0} className="p-2.5 bg-white border border-slate-200 text-slate-500 hover:bg-slate-50 rounded-xl transition-all flex items-center gap-2 text-[10px] font-black uppercase tracking-widest disabled:opacity-40">
-                          <RotateCcw className="w-3.5 h-3.5" /> Undo
-                        </button>
-                        <button onClick={redoClusterEdit} disabled={clusterFuture.length === 0} className="p-2.5 bg-white border border-slate-200 text-slate-500 hover:bg-slate-50 rounded-xl transition-all flex items-center gap-2 text-[10px] font-black uppercase tracking-widest disabled:opacity-40">
-                          <RotateCw className="w-3.5 h-3.5" /> Redo
-                        </button>
-                        <button onClick={keepAllClustersAsFinal} disabled={state.clusters.length === 0} className="p-2.5 bg-emerald-50 border border-emerald-200 text-emerald-700 hover:bg-emerald-100 rounded-xl transition-all flex items-center gap-2 text-[10px] font-black uppercase tracking-widest disabled:opacity-40">
-                          <CheckCircle className="w-3.5 h-3.5" /> Keep All
-                        </button>
-                        <button onClick={async () => { 
-                          setClusterPast([]);
-                          setClusterFuture([]);
-                            setState(s => ({ ...s, clusters: [], reconciliationList: [], processingStatus: { total: state.files.length, processed: 0, currentStep: 'Running Gemini Cluster Analysis...', isComplete: false } })); 
-                            try { 
-                                const clusters = await clusterPages(state.files, state.tier); 
-                              setState(s => ({ ...s, clusters: normalizeClusterSet(markClustersAsAiProposed(clusters)), reconciliationList: [], processingStatus: { ...s.processingStatus, isComplete: true, processed: state.files.length } })); 
-                            setTimeout(() => syncReconciliation(), 0);
-                            } catch (e) { 
-                                alert("Clustering failed."); 
-                                setState(s => ({ ...s, processingStatus: { ...s.processingStatus, isComplete: true } }));
-                            } 
-                        }} className="bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-2.5 rounded-xl text-xs font-black uppercase tracking-tight flex items-center gap-2 shadow-lg disabled:opacity-50" disabled={state.processingStatus.total > 0 && !state.processingStatus.isComplete}><Sparkles className="w-4 h-4" /> AI Document Indexing</button>
-                    </div>
-                 )}
-                 <div className="flex-1 p-12 overflow-y-auto custom-scrollbar">
+                 <div className="flex-1 p-8 overflow-y-auto custom-scrollbar">
                    <div className="max-w-7xl mx-auto space-y-12">
                      {state.clusters.length > 0 && (
                        <div className="bg-white border rounded-[24px] p-4 flex flex-wrap items-center gap-3">
@@ -1868,10 +1874,15 @@ const App: React.FC = () => {
                              const isShared = usageCount > 1;
                              const segmentRefs = (c.pageRefs || []).filter(ref => ref.pageId === pid && typeof ref.startChar === 'number' && typeof ref.endChar === 'number');
                              const isDragging = dragReorderState?.pageId === pid && dragReorderState?.clusterId === c.id;
+                             const isIrrelevant = !!p.irrelevant;
+                             const toggleIrrelevant = () => {
+                               setState(s => ({ ...s, files: s.files.map(f => f.id === pid ? { ...f, irrelevant: !f.irrelevant } : f) }));
+                               setDirtyClusterIds(prev => new Set(prev).add(c.id));
+                             };
                              return (
                                <div
                                  key={pid}
-                                 className={'shrink-0 space-y-2 cursor-move ' + (isDragging ? 'opacity-40' : '')}
+                                 className={'shrink-0 space-y-2 cursor-move ' + (isDragging ? 'opacity-40' : '') + (isIrrelevant ? ' opacity-50' : '')}
                                  draggable
                                  onDragStart={() => setDragReorderState({ pageId: pid, clusterId: c.id })}
                                  onDragEnd={() => setDragReorderState(null)}
@@ -1894,13 +1905,23 @@ const App: React.FC = () => {
                                  }}
                                >
                                  <div className="relative group">
-                                   <img src={p.previewUrl} className="h-64 w-48 object-cover rounded-xl border shadow-sm" />
-                                   <button
-                                     onClick={() => setPageViewId(p.id)}
-                                     className="absolute inset-0 flex items-center justify-center bg-black/0 group-hover:bg-black/40 rounded-xl transition-all opacity-0 group-hover:opacity-100"
-                                   >
-                                     <ZoomIn className="w-8 h-8 text-white drop-shadow" />
-                                   </button>
+                                   <img src={p.previewUrl} className={'h-64 w-48 object-cover rounded-xl border shadow-sm transition-all ' + (isIrrelevant ? 'grayscale' : '')} />
+                                   {isIrrelevant && (
+                                     <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                                       <span className="bg-slate-700/80 text-white text-[9px] font-black uppercase tracking-widest px-2 py-1 rounded-lg">Irrelevant</span>
+                                     </div>
+                                   )}
+                                   <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/0 group-hover:bg-black/40 rounded-xl transition-all opacity-0 group-hover:opacity-100">
+                                     <button onClick={() => setPageViewId(p.id)}>
+                                       <ZoomIn className="w-8 h-8 text-white drop-shadow" />
+                                     </button>
+                                     <button
+                                       onClick={e => { e.stopPropagation(); toggleIrrelevant(); }}
+                                       className={'text-[8px] font-black uppercase tracking-widest px-2 py-1 rounded-lg transition-all ' + (isIrrelevant ? 'bg-white text-slate-900' : 'bg-slate-700/80 text-white hover:bg-red-600/80')}
+                                     >
+                                       {isIrrelevant ? 'Restore' : 'Mark irrelevant'}
+                                     </button>
+                                   </div>
                                  </div>
                                  <div className="flex flex-col gap-1 w-48">
                                    <span className="text-[10px] font-bold text-slate-600 truncate" title={p.indexName}>{p.indexName}</span>
@@ -1997,27 +2018,97 @@ const App: React.FC = () => {
                          </div>
                        </div>
                      ))}
+                     {/* ── Pages section — only shown before indexing ── */}
+                     {state.clusters.length === 0 && <div className="border-t pt-10">
+                       <button
+                         onClick={() => setPagesCollapsed(v => !v)}
+                         className="w-full flex items-center justify-between mb-6 group"
+                       >
+                         <span className="flex items-center gap-2 text-xs font-black uppercase tracking-widest text-slate-500 group-hover:text-slate-800 transition-colors">
+                           <LayoutGrid className="w-4 h-4" />
+                           All Pages ({state.files.length})
+                           {state.clusters.length > 0 && unassignedPages.length > 0 && (
+                             <span className="text-amber-600">— {unassignedPages.length} unassigned</span>
+                           )}
+                         </span>
+                         <ChevronDown className={`w-4 h-4 text-slate-400 transition-transform duration-200 ${pagesCollapsed ? '-rotate-90' : ''}`} />
+                       </button>
+                       {!pagesCollapsed && (
+                         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-8">
+                           {filteredPages.map(page => (
+                             <div key={page.id} className="bg-white rounded-[32px] border overflow-hidden group hover:border-blue-500 hover:shadow-2xl transition-all flex flex-col shadow-sm relative">
+                               {page.status === 'transcribing' && (
+                                 <div className="absolute inset-0 z-10 bg-white/60 backdrop-blur-[2px] flex flex-col items-center justify-center p-6 text-center animate-in fade-in duration-300">
+                                   <Loader2 className="w-10 h-10 text-blue-600 animate-spin mb-3" />
+                                   <div className="text-[10px] font-black uppercase tracking-widest text-slate-900">Transcribing...</div>
+                                   <div className="text-[8px] font-bold text-slate-500 uppercase mt-1">Gemini AI Pipeline</div>
+                                 </div>
+                               )}
+                               <div className="relative aspect-[4/5] overflow-hidden bg-slate-100 cursor-zoom-in" onClick={() => setPageViewId(page.id)}>
+                                 <img src={page.previewUrl} alt={page.indexName} className={`w-full h-full object-cover transition-transform duration-700 group-hover:scale-110 ${page.status === 'transcribing' ? 'grayscale opacity-50' : ''}`} style={{ transform: `rotate(${page.rotation || 0}deg)` }} />
+                                 <div className="absolute top-4 left-4 flex flex-col gap-2">
+                                   <div className="bg-white/95 backdrop-blur-sm px-3 py-1.5 rounded-xl text-[10px] font-black text-slate-800 shadow-xl uppercase">{page.indexName.split('-').pop()?.trim()}</div>
+                                   {page.productionMode && (
+                                     <div className={`px-2 py-1 rounded-lg text-[8px] font-black uppercase tracking-tight shadow-lg w-fit ${page.productionMode === 'Handwritten' ? 'bg-amber-400 text-amber-950' : page.productionMode === 'Printed' ? 'bg-blue-500 text-white' : page.productionMode === 'Typewritten' ? 'bg-indigo-600 text-white' : page.productionMode === 'No Text' ? 'bg-slate-400 text-white' : 'bg-purple-500 text-white'}`}>{page.productionMode}</div>
+                                   )}
+                                 </div>
+                                 {page.confidenceScore !== undefined && page.confidenceScore <= 2 && (
+                                   <div className="absolute top-4 right-4 bg-red-500 text-white p-1.5 rounded-full shadow-lg border-2 border-white animate-pulse" title="Low confidence transcription"><AlertCircle className="w-3 h-3" /></div>
+                                 )}
+                                 {state.clusters.length > 0 && (() => {
+                                   const doc = state.clusters.find(c => c.pageIds.includes(page.id));
+                                   return doc ? (
+                                     <div className="absolute bottom-2 left-2 right-2 bg-slate-900/80 text-white px-2 py-1 rounded-lg text-[8px] font-black truncate">Doc #{doc.id}</div>
+                                   ) : (
+                                     <div className="absolute bottom-2 left-2 right-2 bg-amber-500/80 text-white px-2 py-1 rounded-lg text-[8px] font-black">Unassigned</div>
+                                   );
+                                 })()}
+                               </div>
+                               <div className="p-6 flex flex-col gap-5">
+                                 <div>
+                                   <h4 className="font-black text-slate-800 truncate text-sm tracking-tight mb-1">{page.indexName}</h4>
+                                   <div className="flex flex-wrap gap-1">
+                                     <span className="text-[8px] font-black uppercase tracking-widest text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded border">{page.language || '...'}</span>
+                                     {page.confidenceScore !== undefined && (
+                                       <span className={`text-[8px] font-black uppercase tracking-widest px-1.5 py-0.5 rounded border ${page.confidenceScore <= 2 ? 'bg-red-50 text-red-600 border-red-100' : 'bg-emerald-50 text-emerald-600 border-emerald-100'}`}>Conf: {page.confidenceScore}/5</span>
+                                     )}
+                                   </div>
+                                 </div>
+                                 <div className="mt-auto pt-5 border-t">
+                                   <label className="flex items-center gap-2 cursor-pointer select-none group/cb">
+                                     <div className={`w-5 h-5 rounded-lg border flex items-center justify-center transition-all ${page.shouldTranscribe ? 'bg-blue-600 border-blue-600' : 'bg-white border-slate-300'}`}>{page.shouldTranscribe && <CheckSquare className="w-4 h-4 text-white" />}</div>
+                                     <input type="checkbox" className="hidden" checked={page.shouldTranscribe} onChange={e => setState(s => ({ ...s, files: s.files.map(f => f.id === page.id ? { ...f, shouldTranscribe: e.target.checked } : f) }))} />
+                                     <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Mark for OCR</span>
+                                   </label>
+                                 </div>
+                               </div>
+                             </div>
+                           ))}
+                         </div>
+                       )}
+                     </div>}
+
+                     {/* ── Research Index footer ── */}
+                     {state.clusters.length > 0 && (
+                       <div className="flex justify-center pt-8 border-t">
+                         <button onClick={() => setState(s => ({ ...s, uiState: 'entities' }))} className="px-8 py-4 bg-slate-900 text-white rounded-[24px] font-black uppercase italic tracking-tight text-sm shadow-2xl flex items-center gap-3 hover:bg-blue-600 transition-all active:scale-95 group">
+                           Research Index & Reconcile <ChevronRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
+                         </button>
+                       </div>
+                     )}
+
                    </div>
                  </div>
                  {editingClusterId && (
                    <ClusterEditor cluster={state.clusters.find(c => c.id === editingClusterId)!} onClose={() => setEditingClusterId(null)} onSave={(updated) => { commitClusterEdit((clusters) => clusters.map(c => c.id === updated.id ? { ...updated } : c)); setEditingClusterId(null); }} />
                  )}
-                 <div className="bg-white border-t p-6 flex justify-center">
-                    <button 
-                      onClick={() => setState(s => ({ ...s, uiState: 'entities' }))}
-                      className="px-8 py-4 bg-slate-900 text-white rounded-[24px] font-black uppercase italic tracking-tight text-sm shadow-2xl flex items-center gap-3 hover:bg-blue-600 transition-all active:scale-95 group"
-                    >
-                      Research Index & Reconcile
-                      <ChevronRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
-                    </button>
-                 </div>
                </div>
              )}
              {state.uiState === 'entities' && (
                 <div className="flex-1 flex flex-col overflow-hidden">
                     {renderCommonHeader(
-                        <button onClick={() => setState(s => ({ ...s, uiState: 'clustering' }))} className="p-2.5 bg-white border border-slate-200 text-slate-500 hover:bg-slate-50 rounded-xl transition-all flex items-center gap-2 text-[10px] font-black uppercase tracking-widest">
-                            <ChevronLeft className="w-3.5 h-3.5" /> Back to Documents
+                        <button onClick={() => setState(s => ({ ...s, uiState: 'dashboard' }))} className="p-2.5 bg-white border border-slate-200 text-slate-500 hover:bg-slate-50 rounded-xl transition-all flex items-center gap-2 text-[10px] font-black uppercase tracking-widest">
+                            <ChevronLeft className="w-3.5 h-3.5" /> Back
                         </button>
                     )}
                     {renderUnifiedEntities()}

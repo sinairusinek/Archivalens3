@@ -87,6 +87,9 @@ export interface ArchivalPage {
   confidenceScore?: number; // 1-5 rating of transcription confidence
   entities?: NamedEntities; // Entities extracted during transcription
   
+  // Researcher flags
+  irrelevant?: boolean;
+
   // Processing States
   status: 'pending' | 'analyzing' | 'analyzed' | 'transcribing' | 'done' | 'error';
   error?: string;

@@ -519,3 +519,174 @@ export const reanalyzeClusterMetadata = async (cluster: Cluster, pages: Archival
     },
   };
 };
+
+// ── Pairwise clustering helpers ──────────────────────────────────────────────
+
+const runWithConcurrency = async <T>(
+  tasks: (() => Promise<T>)[],
+  concurrency: number,
+  onProgress?: (done: number, total: number) => void
+): Promise<T[]> => {
+  if (tasks.length === 0) return [];
+  const results: T[] = new Array(tasks.length);
+  let nextIndex = 0;
+  let done = 0;
+  const worker = async () => {
+    while (true) {
+      const i = nextIndex++;
+      if (i >= tasks.length) break;
+      results[i] = await tasks[i]();
+      done++;
+      onProgress?.(done, tasks.length);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, worker));
+  return results;
+};
+
+const detectBoundary = async (
+  pageA: ArchivalPage,
+  pageB: ArchivalPage,
+  tier: Tier
+): Promise<{ isBoundary: boolean; confidence: number; reasons: string[] }> => {
+  const modelName = tier === Tier.FREE ? "gemini-3-flash-preview" : "gemini-3-pro-preview";
+  const textA = (pageA.manualTranscription || pageA.generatedTranscription || '').trim();
+  const textB = (pageB.manualTranscription || pageB.generatedTranscription || '').trim();
+  const useImages = textA.length < 50 || textB.length < 50;
+
+  const parts: any[] = [];
+
+  if (useImages) {
+    const [imgA, imgB] = await Promise.all([
+      fileToGenerativePart(pageA.fileObj, pageA.rotation || 0),
+      fileToGenerativePart(pageB.fileObj, pageB.rotation || 0),
+    ]);
+    parts.push(imgA);
+    parts.push({ text: `Above: Page A — ${pageA.indexName}` });
+    parts.push(imgB);
+    parts.push({ text: `Above: Page B — ${pageB.indexName}` });
+  } else {
+    parts.push({ text: `PAGE A [${pageA.indexName}]:\n${textA.slice(0, 2000)}\n\nPAGE B [${pageB.indexName}]:\n${textB.slice(0, 2000)}` });
+  }
+
+  parts.push({ text: `Does Page B begin a NEW archival document, or does it continue the same document as Page A? Signals: new date/author/addressee, document header reset, envelope or cover page, topic shift, page numbering restart, change in handwriting or document type.` });
+
+  const response = await generateContentWithRetry({
+    model: modelName,
+    contents: { parts },
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          isBoundary: { type: Type.BOOLEAN },
+          confidence: { type: Type.INTEGER },
+          reasons: { type: Type.ARRAY, items: { type: Type.STRING } },
+        },
+        required: ["isBoundary", "confidence", "reasons"],
+      },
+    },
+  });
+
+  const result = JSON.parse(repairTruncatedJSON(response.text || "{}"));
+  return {
+    isBoundary: Boolean(result.isBoundary),
+    confidence: typeof result.confidence === 'number' ? Math.max(1, Math.min(5, result.confidence)) : 3,
+    reasons: Array.isArray(result.reasons) ? result.reasons : [],
+  };
+};
+
+export const clusterPagesPairwise = async (
+  pages: ArchivalPage[],
+  tier: Tier,
+  concurrency = 5,
+  onProgress?: (step: string, done: number, total: number) => void
+): Promise<Cluster[]> => {
+  if (pages.length === 0) return [];
+
+  if (pages.length === 1) {
+    return [{
+      id: 1,
+      title: pages[0].indexName,
+      pageRange: 'Page 1',
+      summary: '',
+      pageIds: [pages[0].id],
+      pageRefs: [{ pageId: pages[0].id, source: 'ai' as const }],
+      reviewStatus: 'ai-proposed',
+      aiConfidence: 5,
+      boundaryReasons: [],
+      senders: [], recipients: [],
+      entities: { people: [], organizations: [], prisons: [], roles: [] },
+    }];
+  }
+
+  // Step 1: detect boundaries between all adjacent page pairs in parallel
+  const pairCount = pages.length - 1;
+  const boundaryTasks = pages.slice(0, -1).map((pageA, i) => async () =>
+    detectBoundary(pageA, pages[i + 1], tier)
+  );
+
+  const boundaryResults = await runWithConcurrency(
+    boundaryTasks,
+    concurrency,
+    (done) => onProgress?.('Detecting document boundaries', done, pairCount)
+  );
+
+  // Step 2: group pages into segments based on detected boundaries
+  type Segment = { pages: ArchivalPage[]; boundaryReasons: string[]; confidence: number };
+  const segments: Segment[] = [];
+  let current: ArchivalPage[] = [pages[0]];
+  let currentReasons: string[] = [];
+  let minConfidence = 5;
+
+  for (let i = 0; i < boundaryResults.length; i++) {
+    const { isBoundary, confidence, reasons } = boundaryResults[i];
+    if (isBoundary) {
+      segments.push({ pages: current, boundaryReasons: currentReasons, confidence: minConfidence });
+      current = [pages[i + 1]];
+      currentReasons = reasons;
+      minConfidence = confidence;
+    } else {
+      current.push(pages[i + 1]);
+      minConfidence = Math.min(minConfidence, confidence);
+    }
+  }
+  segments.push({ pages: current, boundaryReasons: currentReasons, confidence: minConfidence });
+
+  // Step 3: extract metadata for each segment in parallel
+  const metaTasks = segments.map((seg, idx) => async (): Promise<Partial<Cluster>> => {
+    const tempCluster: Cluster = {
+      id: idx + 1,
+      title: `Document ${idx + 1}`,
+      pageRange: '',
+      summary: '',
+      pageIds: seg.pages.map(p => p.id),
+      reviewStatus: 'ai-proposed',
+    };
+    try {
+      return await reanalyzeClusterMetadata(tempCluster, seg.pages, tier);
+    } catch {
+      return { title: `Document ${idx + 1}`, summary: '' };
+    }
+  });
+
+  const metaResults = await runWithConcurrency(
+    metaTasks,
+    concurrency,
+    (done) => onProgress?.('Extracting document metadata', done, segments.length)
+  );
+
+  // Step 4: assemble final Cluster objects — all pages guaranteed assigned
+  return segments.map((seg, idx) => ({
+    id: idx + 1,
+    title: metaResults[idx].title || `Document ${idx + 1}`,
+    pageRange: '',
+    summary: metaResults[idx].summary || '',
+    pageIds: seg.pages.map(p => p.id),
+    pageRefs: seg.pages.map(p => ({ pageId: p.id, source: 'ai' as const })),
+    reviewStatus: 'ai-proposed' as const,
+    aiConfidence: seg.confidence,
+    boundaryReasons: seg.boundaryReasons,
+    ...(metaResults[idx] as object),
+  } as Cluster));
+};
